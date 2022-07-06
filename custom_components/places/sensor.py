@@ -609,18 +609,12 @@ class Places(Entity):
                 street_number = osm_decoded["address"]["house_number"]
             if "road" in osm_decoded["address"]:
                 street = osm_decoded["address"]["road"]
-
             if "city" in osm_decoded["address"]:
                 city = osm_decoded["address"]["city"]
-            elif "town" in osm_decoded["address"]:
+            if "town" in osm_decoded["address"]:
                 city = osm_decoded["address"]["town"]
-            elif "village" in osm_decoded["address"]:
+            if "village" in osm_decoded["address"]:
                 city = osm_decoded["address"]["village"]
-            elif "township" in osm_decoded["address"]:
-                city = osm_decoded["address"]["township"]
-            elif "municipality" in osm_decoded["address"]:
-                city = osm_decoded["address"]["municipality"]
-
             if "city_district" in osm_decoded["address"]:
                 postal_town = osm_decoded["address"]["city_district"]
             if "suburb" in osm_decoded["address"]:
