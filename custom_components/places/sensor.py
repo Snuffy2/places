@@ -253,6 +253,7 @@ ATTR_CITY = 'city'
 ATTR_POSTAL_TOWN = 'postal_town'
 ATTR_POSTAL_CODE = 'postal_code'
 ATTR_REGION = 'state_province'
+ATTR_STATE_ABBR = 'state_abbr'
 ATTR_COUNTRY = 'country'
 ATTR_COUNTY = 'county'
 ATTR_FORMATTED_ADDRESS = 'formatted_address'
@@ -262,6 +263,7 @@ ATTR_PLACE_CATEGORY = 'place_category'
 ATTR_PLACE_NEIGHBOURHOOD = 'neighbourhood'
 ATTR_DEVICETRACKER_ID = 'devicetracker_entityid'
 ATTR_DEVICETRACKER_ZONE = 'devicetracker_zone'
+ATTR_DEVICETRACKER_ZONE_NAME = 'devicetracker_zone_name'
 ATTR_PICTURE = 'entity_picture'
 ATTR_LATITUDE_OLD = 'previous_latitude'
 ATTR_LONGITUDE_OLD = 'previous_longitude'
@@ -277,6 +279,7 @@ ATTR_LOCATION_CURRENT = 'current_location'
 ATTR_LOCATION_PREVIOUS = 'previous_location'
 ATTR_DIRECTION_OF_TRAVEL = 'direction_of_travel'
 ATTR_MAP_LINK = 'map_link'
+ATTR_MY_FORMATTED_PLACE = 'my_formatted_place'
 
 DEFAULT_NAME = 'places'
 DEFAULT_OPTION = 'zone, place'
@@ -344,6 +347,7 @@ class Places(Entity):
         self._postal_code = None
         self._city = None
         self._region = None
+        self._state_abbr = None
         self._country = None
         self._county = None
         self._formatted_address = None
@@ -358,6 +362,7 @@ class Places(Entity):
         self._latitude = home_latitude
         self._longitude = home_longitude
         self._devicetracker_zone = 'Home'
+        self._devicetracker_zone_name = 'Home'
         self._mtime = str(datetime.now())
         self._distance_km = 0
         self._distance_m = 0
@@ -366,6 +371,7 @@ class Places(Entity):
         self._updateskipped = 0
         self._direction = 'stationary'
         self._map_link = None
+        self._my_formatted_place = None
         #'https://www.google.com/maps/@' + home_latitude + "," + home_longitude + ',19z'
 
         # Check if devicetracker_id was specified correctly
@@ -401,6 +407,7 @@ class Places(Entity):
             ATTR_POSTAL_TOWN: self._postal_town,
             ATTR_POSTAL_CODE: self._postal_code,
             ATTR_REGION: self._region,
+            ATTR_STATE_ABBR: self._state_abbr,
             ATTR_COUNTRY: self._country,
             ATTR_COUNTY: self._county,
             ATTR_FORMATTED_ADDRESS: self._formatted_address,
@@ -414,6 +421,7 @@ class Places(Entity):
             ATTR_LONGITUDE: self._longitude,
             ATTR_DEVICETRACKER_ID: self._devicetracker_id,
             ATTR_DEVICETRACKER_ZONE: self._devicetracker_zone,
+            ATTR_DEVICETRACKER_ZONE_NAME: self._devicetracker_zone_name,
             ATTR_HOME_ZONE: self._home_zone,
             ATTR_PICTURE: self._entity_picture,
             ATTR_DISTANCE_KM: self._distance_km,
@@ -425,7 +433,8 @@ class Places(Entity):
             ATTR_HOME_LONGITUDE: self._home_longitude,
             ATTR_DIRECTION_OF_TRAVEL: self._direction,
             ATTR_MAP_LINK: self._map_link,
-            ATTR_OPTIONS: self._options
+            ATTR_OPTIONS: self._options,
+            ATTR_MY_FORMATTED_PLACE: self._my_formatted_place
         }
 
 
@@ -508,9 +517,21 @@ class Places(Entity):
               """Update if location has changed."""
 
               devicetracker_zone = self.hass.states.get(self._devicetracker_id).state
+              _LOGGER.info( "(" + self._name + ") DeviceTracker Zone (before update): " + devicetracker_zone )
+              
+              devicetracker_zone_id = self.hass.states.get(self._devicetracker_id).attributes.get('zone')
+              devicetracker_zone_id = 'zone.'+devicetracker_zone_id
+              _LOGGER.debug( "(" + self._name + ") DeviceTracker Zone ID (before update): " + devicetracker_zone_id )
+              
+              devicetracker_zone_name_state = self.hass.states.get(devicetracker_zone_id)
+              if devicetracker_zone_name_state:
+                  devicetracker_zone_name = self.hass.states.get(devicetracker_zone_id).name
+              else:
+                  devicetracker_zone_name = devicetracker_zone
+              _LOGGER.debug( "(" + self._name + ") DeviceTracker Zone Name (before update): " + devicetracker_zone_name )
+              
               distance_traveled = distance(float(new_latitude), float(new_longitude), float(old_latitude), float(old_longitude))
 
-              _LOGGER.info( "(" + self._name + ") DeviceTracker Zone (before update): " + devicetracker_zone )
               _LOGGER.info( "(" + self._name + ") Meters traveled since last update: " + str(round(distance_traveled)) )
 
         proceed_with_update = True
@@ -544,6 +565,7 @@ class Places(Entity):
             self._location_current = current_location
             self._location_previous = previous_location
             self._devicetracker_zone = devicetracker_zone
+            self._devicetracker_zone_name = devicetracker_zone_name
             self._distance_km = distance_from_home
             self._distance_m = distance_m
             self._direction = direction
@@ -578,11 +600,13 @@ class Places(Entity):
             city = '-'
             postal_town = '-'
             region = '-'
+            state_abbr = '-'
             county = '-'
             country = '-'
             postal_code = ''
             formatted_address = ''
             target_option = ''
+            my_formatted_place = ''
             
             if "place" in self._options:
                 place_type = osm_decoded["type"]
@@ -600,8 +624,6 @@ class Places(Entity):
                     if "name:" + language in osm_decoded["namedetails"]:
                         place_name = osm_decoded["namedetails"]["name:" + language]
                         break
-                if "neighbourhood" in osm_decoded["address"]:
-                    place_neighbourhood = osm_decoded["address"]["neighbourhood"]
                 if self._devicetracker_zone == 'not_home' and place_name != 'house':
                     new_state = place_name
                     
@@ -609,18 +631,31 @@ class Places(Entity):
                 street_number = osm_decoded["address"]["house_number"]
             if "road" in osm_decoded["address"]:
                 street = osm_decoded["address"]["road"]
+                
+            if "neighbourhood" in osm_decoded["address"]:
+                place_neighbourhood = osm_decoded["address"]["neighbourhood"]
+            elif "hamlet" in osm_decoded["address"]:
+                place_neighbourhood = osm_decoded["address"]["hamlet"]
+                
             if "city" in osm_decoded["address"]:
                 city = osm_decoded["address"]["city"]
-            if "town" in osm_decoded["address"]:
+            elif "town" in osm_decoded["address"]:
                 city = osm_decoded["address"]["town"]
-            if "village" in osm_decoded["address"]:
+            elif "village" in osm_decoded["address"]:
                 city = osm_decoded["address"]["village"]
+            elif "township" in osm_decoded["address"]:
+                city = osm_decoded["address"]["township"]
+            elif "municipality" in osm_decoded["address"]:
+                city = osm_decoded["address"]["municipality"]
+
             if "city_district" in osm_decoded["address"]:
                 postal_town = osm_decoded["address"]["city_district"]
             if "suburb" in osm_decoded["address"]:
                 postal_town = osm_decoded["address"]["suburb"]
             if "state" in osm_decoded["address"]:
                 region = osm_decoded["address"]["state"]
+            if "ISO3166-2-lvl4" in osm_decoded["address"]:
+                state_abbr = osm_decoded["address"]["ISO3166-2-lvl4"].split("-")[1].upper()
             if "county" in osm_decoded["address"]:
                 county = osm_decoded["address"]["county"]
             if "country" in osm_decoded["address"]:
@@ -640,6 +675,7 @@ class Places(Entity):
             self._city = city
             self._postal_town = postal_town
             self._region = region
+            self._state_abbr = state_abbr
             self._county = county
             self._country = country
             self._postal_code = postal_code
@@ -654,6 +690,7 @@ class Places(Entity):
                     city = postal_town
                     if city == '-':
                         city = county
+
 
                 # Options:  "zone, place, street_number, street, city, county, state, postal_code, country, formatted_address"
 
@@ -725,11 +762,49 @@ class Places(Entity):
                 new_state = devicetracker_zone
                 _LOGGER.debug( "(" + self._name + ") New State from DeviceTracker set to: " + new_state)
 
+            # My Formatted Place
+            my_formatted_place_array = []
+            if self._devicetracker_zone == "stationary" or self._devicetracker_zone == "away" or self._devicetracker_zone == "not_home":
+                if self._direction != 'stationary' and ( self._place_category == 'highway' or self._place_type == 'motorway' ):
+                    my_formatted_place_array.append('Driving')
+                if self._place_name == '-':
+                    if self._place_category == 'highway' and self._street == 'Unnamed Road':
+                        my_formatted_place_array.append(self._place_type.title().replace("Proposed","").replace("Construction","").replace("-","").strip()+' '+self._place_category.title().strip())
+                    elif self._place_type == 'unclassified' or self._place_type == '-':
+                        if self._place_category != '-':
+                            my_formatted_place_array.append(self._place_category.title().strip())
+                    else:
+                        my_formatted_place_array.append(self._place_type.title().strip())
+                    if self._street != 'Unnamed Road':
+                        my_formatted_place_array.append(self._street_number.replace("-","").strip()+' '+self._street.replace("-","").strip())
+                    elif self._place_neighbourhood != '-':
+                        my_formatted_place_array.append(self._place_neighbourhood.strip()+' Neighborhood')
+                else:
+                    my_formatted_place_array.append(self._place_name.strip())
+                if self._city != '-':
+                    my_formatted_place_array.append(self._city.replace(" Township","").strip())
+                elif self._county != '-':
+                    my_formatted_place_array.append(self._county.strip())
+                if self._region != '-':
+                    my_formatted_place_array.append(self._state_abbr)
+            #elif self._devicetracker_zone == 'home':
+                #my_formatted_place_array.append(self._devicetracker_zone.title().strip())
+            else:
+                #my_formatted_place_array.append(self._devicetracker_zone.strip())
+                my_formatted_place_array.append(devicetracker_zone_name.strip())
+            my_formatted_place = ', '.join( item for item in my_formatted_place_array)
+            my_formatted_place = my_formatted_place.replace('\n',' ').replace('  ',' ').strip()
+            self._my_formatted_place = my_formatted_place
+
+            # End My Formatted Place
+
+
             current_time = "%02d:%02d" % (now.hour, now.minute)
             
             if previous_state != new_state:
                 _LOGGER.info( "(" + self._name + ") New state built using options: " + self._options)
                 _LOGGER.debug( "(" + self._name + ") Building EventData for (" + new_state +")")
+                new_state = new_state[:(255-14)]
                 self._state = new_state + " (since " + current_time + ")"
                 event_data = {}
                 event_data['entity'] = self._name
@@ -739,6 +814,7 @@ class Places(Entity):
                 event_data['distance_from_home'] = distance_from_home
                 event_data['direction'] = direction
                 event_data['devicetracker_zone'] = devicetracker_zone
+                event_data['devicetracker_zone_name'] = devicetracker_zone_name
                 event_data['latitude'] = self._latitude
                 event_data['longitude'] = self._longitude
                 event_data['previous_latitude'] = self._latitude_old
@@ -758,6 +834,7 @@ class Places(Entity):
         self._postal_town = None
         self._postal_code = None
         self._region = None
+        self._state_abbr = None
         self._country = None
         self._county = None
         self._formatted_address = None
