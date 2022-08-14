@@ -363,7 +363,7 @@ class Places(Entity):
         language,
         extended_attr,
     ):
-        """Initialize the sensor."""
+        """  Initialize the sensor.  """
         self._hass = hass
         self._name = name
         self._api_key = api_key
