@@ -318,7 +318,7 @@ TRACKABLE_DOMAINS = ["device_tracker"]
 
 
 def setup_platform(hass, config, add_devices, discovery_info=None):
-    """Setup the sensor platform."""
+    """  Setup the sensor platform.  """
     name = config.get(CONF_NAME)
     api_key = config.get(CONF_API_KEY)
     devicetracker_id = config.get(CONF_DEVICETRACKER_ID)
