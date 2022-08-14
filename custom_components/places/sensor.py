@@ -348,7 +348,7 @@ def setup_platform(hass, config, add_devices, discovery_info=None):
 
 
 class Places(Entity):
-    """  Representation of a Places Sensor.  """
+    """Representation of a Places Sensor."""
 
     def __init__(
         self,
