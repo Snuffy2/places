@@ -1048,9 +1048,7 @@ class Places(Entity):
                 )
             elif "formatted_place" in display_options:
                 new_state = self._formatted_place
-                _LOGGER.info(
-                    "(" + self._name + ") New State using formatted_place: " + new_state
-                )
+                _LOGGER.info("(" + self._name + ") New State using formatted_place: " + new_state)
             elif (
                 self._devicetracker_zone.lower() == "not_home"
                 or "stationary" in self._devicetracker_zone.lower()
