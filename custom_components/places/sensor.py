@@ -964,7 +964,9 @@ class Places(Entity):
             else:
                 _LOGGER.debug("(" + self._name + ") Keeping initial last_place_name")
             self._last_place_name = last_place_name
-            _LOGGER.debug("(" + self._name + ") Last Place Name (Final): " + str(last_place_name))
+            _LOGGER.debug(
+                "(" + self._name + ") Last Place Name (Final): " + str(last_place_name)
+            )
             isDriving = False
 
             display_options = []
