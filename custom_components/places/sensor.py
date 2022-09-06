@@ -151,21 +151,29 @@ To enable detailed logging for this component, add the following to your configu
 
 """
 
-import logging, json, requests
-from datetime import datetime, timedelta
-from requests import get
-from math import radians, cos, sin, asin, sqrt
+import json
+import logging
+from datetime import datetime
+from datetime import timedelta
+from math import asin
+from math import cos
+from math import radians
+from math import sin
+from math import sqrt
 
-import voluptuous as vol
-import homeassistant.helpers.location as location
 import homeassistant.helpers.config_validation as cv
-
+import homeassistant.helpers.location as location
+import requests
+import voluptuous as vol
 from homeassistant.components.sensor import PLATFORM_SCHEMA
+from homeassistant.const import CONF_API_KEY
+from homeassistant.const import CONF_NAME
+from homeassistant.const import CONF_SCAN_INTERVAL
+from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.event import track_state_change
 from homeassistant.util import Throttle
 from homeassistant.util.location import distance
-from homeassistant.helpers.entity import Entity
-from homeassistant.const import CONF_API_KEY, CONF_NAME, CONF_SCAN_INTERVAL
+from requests import get
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1046,7 +1054,8 @@ class Places(Entity):
                 _LOGGER.info(
                     "("
                     + self._name
-                    + ") An error occurred contacting the web service for OpenStreetMap")
+                    + ") An error occurred contacting the web service for OpenStreetMap"
+                )
             elif "formatted_place" in display_options:
                 new_state = self._formatted_place
                 _LOGGER.info(
