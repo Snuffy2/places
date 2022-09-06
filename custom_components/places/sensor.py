@@ -1071,7 +1071,9 @@ class Places(Entity):
                 _LOGGER.debug(
                     "("
                     + self._name
-                    + ") Building State from Display Options: "+ self._options)
+                    + ") Building State from Display Options: "
+                    + self._options
+                )
 
                 user_display = []
 
