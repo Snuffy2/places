@@ -1068,10 +1068,12 @@ class Places(Entity):
 
                 # Options:  "formatted_place, zone, zone_name, place, street_number, street, city, county, state, postal_code, country, formatted_address"
 
-                _LOGGER.debug("("
+                _LOGGER.debug(
+                    "("
                     + self._name
                     + ") Building State from Display Options: "
-                    + self._options)
+                    + self._options
+                )
 
                 user_display = []
 
