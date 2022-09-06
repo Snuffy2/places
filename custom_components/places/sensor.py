@@ -1051,9 +1051,11 @@ class Places(Entity):
 
             if "error_message" in osm_decoded:
                 new_state = osm_decoded["error_message"]
-                _LOGGER.info("("
+                _LOGGER.info(
+                    "("
                     + self._name
-                    + ") An error occurred contacting the web service for OpenStreetMap")
+                    + ") An error occurred contacting the web service for OpenStreetMap"
+                )
             elif "formatted_place" in display_options:
                 new_state = self._formatted_place
                 _LOGGER.info(
