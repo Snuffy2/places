@@ -1046,8 +1046,7 @@ class Places(Entity):
                 _LOGGER.info(
                     "("
                     + self._name
-                    + ") An error occurred contacting the web service for OpenStreetMap"
-                )
+                    + ") An error occurred contacting the web service for OpenStreetMap")
             elif "formatted_place" in display_options:
                 new_state = self._formatted_place
                 _LOGGER.info(
