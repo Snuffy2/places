@@ -1,0 +1,28 @@
+name: Create Zip on Release
+on:
+  workflow_dispatch:
+  release:
+    types: [released]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3.6.0
+    - name: Create Zip
+      uses: thedoctor0/zip-release@0.7.1
+      with:
+        type: 'zip'
+        filename: 'places.zip'
+        path: ./custom-components/places
+        exclusions: '*.git* /*node_modules/* .editorconfig'
+    - name: Upload Zip
+      if: ${{ github.event_name == 'release' }}
+      uses: Roang-zero1/github-upload-release-artifacts-action@v3
+      with:
+        args: ./places.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - uses: actions/upload-artifact@master
+      with:
+        name: places.zip
+        path: ./places.zip
