@@ -20,9 +20,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up from a config entry."""
 
     # _LOGGER.debug("[init async_setup_entry] entry: %s", entry.data)
-    hass.data.setdefault(DOMAIN, {})
     hass_data: MutableMapping[str, Any] = dict(entry.data)
-    hass.data[DOMAIN][entry.entry_id] = hass_data
+    entry.runtime_data = hass_data
+    # hass.data.setdefault(DOMAIN, {})
 
     # This creates each HA object for each platform your device requires.
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -36,7 +36,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # details
     _LOGGER.info("Unloading: %s", entry.data)
     unload_ok: bool = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
 
     return unload_ok
