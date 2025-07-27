@@ -101,3 +101,9 @@ def write_sensor_to_json(
 def clear_since_from_state(orig_state: str) -> str:
     """Remove the 'since' part from the state string."""
     return re.sub(r" \(since \d\d[:/]\d\d\)", "", orig_state)
+
+
+def safe_truncate(val: Any, max_len: int) -> str:
+    """Safely truncate a string representation of val to max_len characters."""
+    s = str(val) if val is not None else ""
+    return s[:max_len] if len(s) > max_len else s
