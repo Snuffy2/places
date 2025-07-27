@@ -35,8 +35,8 @@ class AdvancedOptionsParser:
         """Initialize the parser with a sensor instance."""
         self.sensor = sensor
         self.state_list: list = []
-        self.street_num_i = -1
-        self.street_i = -1
+        self._street_num_i = -1
+        self._street_i = -1
         self._temp_i: int = 0
 
     async def build_from_advanced_options(self, curr_options: str) -> None:
@@ -369,7 +369,7 @@ class AdvancedOptionsParser:
 
     async def compile_state(self) -> str:
         """Compile the state list into a formatted string."""
-        self.street_num_i += 1
+        self._street_num_i += 1
         first = True
         result = ""
         for i, out in enumerate(self.state_list):
@@ -379,7 +379,7 @@ class AdvancedOptionsParser:
                     result = str(out)
                     first = False
                 else:
-                    if i == self.street_i and i == self.street_num_i:
+                    if i == self._street_i and i == self._street_num_i:
                         result += " "
                     else:
                         result += ", "

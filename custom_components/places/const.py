@@ -359,3 +359,33 @@ DISPLAY_OPTIONS_MAP: MutableMapping[str, str] = {
     "zone": ATTR_DEVICETRACKER_ZONE,
     "zone_name": ATTR_DEVICETRACKER_ZONE_NAME,
 }
+
+CITY_LIST = [
+    "city",
+    "town",
+    "village",
+    "township",
+    "hamlet",
+    "city_district",
+    "municipality",
+]
+
+POSTAL_TOWN_LIST = [
+    "city",
+    "town",
+    "village",
+    "township",
+    "hamlet",
+    "borough",
+    "suburb",
+]
+
+NEIGHBOURHOOD_LIST = [
+    "village",
+    "township",
+    "hamlet",
+    "borough",
+    "suburb",
+    "quarter",
+    "neighbourhood",
+]

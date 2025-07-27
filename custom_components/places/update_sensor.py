@@ -633,7 +633,7 @@ class PlacesUpdater:
                 _LOGGER.warning(
                     "(%s) Unknown OSM type: %s",
                     self.sensor.get_attr(CONF_NAME),
-                    self.sensor.get_attr(ATTR_OSM_TYPE)
+                    self.sensor.get_attr(ATTR_OSM_TYPE),
                 )
                 return
 
@@ -811,12 +811,8 @@ class PlacesUpdater:
 
         return proceed_with_update
 
-    async def update_coordinates_and_distance(self) -> int:
-        """Update coordinates and calculate distances."""
-        last_distance_traveled_m: float = self.sensor.get_attr_safe_float(ATTR_DISTANCE_FROM_HOME_M)
-        proceed_with_update = 1
-        # 0: False. 1: True. 2: False, but set direction of travel to stationary
-
+    async def update_location_attributes(self) -> None:
+        """Update current, previous, and home location attributes."""
         if not self.sensor.is_attr_blank(ATTR_LATITUDE) and not self.sensor.is_attr_blank(
             ATTR_LONGITUDE
         ):
@@ -839,6 +835,8 @@ class PlacesUpdater:
                 f"{self.sensor.get_attr(ATTR_HOME_LATITUDE)},{self.sensor.get_attr(ATTR_HOME_LONGITUDE)}",
             )
 
+    async def calculate_distances(self) -> None:
+        """Calculate distances from home in meters, km, and mi."""
         if (
             not self.sensor.is_attr_blank(ATTR_LATITUDE)
             and not self.sensor.is_attr_blank(ATTR_LONGITUDE)
@@ -864,89 +862,113 @@ class PlacesUpdater:
                     round(self.sensor.get_attr_safe_float(ATTR_DISTANCE_FROM_HOME_M) / 1609, 3),
                 )
 
-            if not self.sensor.is_attr_blank(ATTR_LATITUDE_OLD) and not self.sensor.is_attr_blank(
-                ATTR_LONGITUDE_OLD
-            ):
+    async def calculate_travel_distance(self) -> None:
+        """Calculate distance traveled since last update in meters and miles."""
+        if not self.sensor.is_attr_blank(ATTR_LATITUDE_OLD) and not self.sensor.is_attr_blank(
+            ATTR_LONGITUDE_OLD
+        ):
+            self.sensor.set_attr(
+                ATTR_DISTANCE_TRAVELED_M,
+                distance(
+                    float(self.sensor.get_attr_safe_str(ATTR_LATITUDE)),
+                    float(self.sensor.get_attr_safe_str(ATTR_LONGITUDE)),
+                    float(self.sensor.get_attr_safe_str(ATTR_LATITUDE_OLD)),
+                    float(self.sensor.get_attr_safe_str(ATTR_LONGITUDE_OLD)),
+                ),
+            )
+            if not self.sensor.is_attr_blank(ATTR_DISTANCE_TRAVELED_M):
                 self.sensor.set_attr(
-                    ATTR_DISTANCE_TRAVELED_M,
-                    distance(
-                        float(self.sensor.get_attr_safe_str(ATTR_LATITUDE)),
-                        float(self.sensor.get_attr_safe_str(ATTR_LONGITUDE)),
-                        float(self.sensor.get_attr_safe_str(ATTR_LATITUDE_OLD)),
-                        float(self.sensor.get_attr_safe_str(ATTR_LONGITUDE_OLD)),
+                    ATTR_DISTANCE_TRAVELED_MI,
+                    round(
+                        self.sensor.get_attr_safe_float(ATTR_DISTANCE_TRAVELED_M) / 1609,
+                        3,
                     ),
                 )
-                if not self.sensor.is_attr_blank(ATTR_DISTANCE_TRAVELED_M):
-                    self.sensor.set_attr(
-                        ATTR_DISTANCE_TRAVELED_MI,
-                        round(
-                            self.sensor.get_attr_safe_float(ATTR_DISTANCE_TRAVELED_M) / 1609,
-                            3,
-                        ),
-                    )
+        else:
+            self.sensor.set_attr(ATTR_DIRECTION_OF_TRAVEL, "stationary")
+            self.sensor.set_attr(ATTR_DISTANCE_TRAVELED_M, 0)
+            self.sensor.set_attr(ATTR_DISTANCE_TRAVELED_MI, 0)
 
-                if last_distance_traveled_m > self.sensor.get_attr_safe_float(
-                    ATTR_DISTANCE_FROM_HOME_M
-                ):
-                    self.sensor.set_attr(ATTR_DIRECTION_OF_TRAVEL, "towards home")
-                elif last_distance_traveled_m < self.sensor.get_attr_safe_float(
-                    ATTR_DISTANCE_FROM_HOME_M
-                ):
-                    self.sensor.set_attr(ATTR_DIRECTION_OF_TRAVEL, "away from home")
-                else:
-                    self.sensor.set_attr(ATTR_DIRECTION_OF_TRAVEL, "stationary")
+    async def determine_direction_of_travel(self, last_distance_traveled_m: float) -> None:
+        """Determine the direction of travel based on distance from home."""
+        if not self.sensor.is_attr_blank(ATTR_DISTANCE_TRAVELED_M):
+            if last_distance_traveled_m > self.sensor.get_attr_safe_float(
+                ATTR_DISTANCE_FROM_HOME_M
+            ):
+                self.sensor.set_attr(ATTR_DIRECTION_OF_TRAVEL, "towards home")
+            elif last_distance_traveled_m < self.sensor.get_attr_safe_float(
+                ATTR_DISTANCE_FROM_HOME_M
+            ):
+                self.sensor.set_attr(ATTR_DIRECTION_OF_TRAVEL, "away from home")
             else:
                 self.sensor.set_attr(ATTR_DIRECTION_OF_TRAVEL, "stationary")
-                self.sensor.set_attr(ATTR_DISTANCE_TRAVELED_M, 0)
-                self.sensor.set_attr(ATTR_DISTANCE_TRAVELED_MI, 0)
-
-            _LOGGER.debug(
-                "(%s) Previous Location: %s",
-                self.sensor.get_attr(CONF_NAME),
-                self.sensor.get_attr(ATTR_LOCATION_PREVIOUS),
-            )
-            _LOGGER.debug(
-                "(%s) Current Location: %s",
-                self.sensor.get_attr(CONF_NAME),
-                self.sensor.get_attr(ATTR_LOCATION_CURRENT),
-            )
-            _LOGGER.debug(
-                "(%s) Home Location: %s",
-                self.sensor.get_attr(CONF_NAME),
-                self.sensor.get_attr(ATTR_HOME_LOCATION),
-            )
-            _LOGGER.info(
-                "(%s) Distance from home [%s]: %s km",
-                self.sensor.get_attr(CONF_NAME),
-                self.sensor.get_attr_safe_str(CONF_HOME_ZONE).split(".")[1],
-                self.sensor.get_attr(ATTR_DISTANCE_FROM_HOME_KM),
-            )
-            _LOGGER.info(
-                "(%s) Travel Direction: %s",
-                self.sensor.get_attr(CONF_NAME),
-                self.sensor.get_attr(ATTR_DIRECTION_OF_TRAVEL),
-            )
-            _LOGGER.info(
-                "(%s) Meters traveled since last update: %s",
-                self.sensor.get_attr(CONF_NAME),
-                round(self.sensor.get_attr_safe_float(ATTR_DISTANCE_TRAVELED_M), 1),
-            )
         else:
-            proceed_with_update = 0
-            # 0: False. 1: True. 2: False, but set direction of travel to stationary
-            _LOGGER.info(
-                "(%s) Problem with updated lat/long, not performing update: "
-                "old_latitude=%s, old_longitude=%s, "
-                "new_latitude=%s, new_longitude=%s, "
-                "home_latitude=%s, home_longitude=%s",
-                self.sensor.get_attr(CONF_NAME),
-                self.sensor.get_attr(ATTR_LATITUDE_OLD),
-                self.sensor.get_attr(ATTR_LONGITUDE_OLD),
-                self.sensor.get_attr(ATTR_LATITUDE),
-                self.sensor.get_attr(ATTR_LONGITUDE),
-                self.sensor.get_attr(ATTR_HOME_LATITUDE),
-                self.sensor.get_attr(ATTR_HOME_LONGITUDE),
-            )
+            self.sensor.set_attr(ATTR_DIRECTION_OF_TRAVEL, "stationary")
+
+    async def update_coordinates_and_distance(self) -> int:
+        """Update coordinates and calculate distances."""
+        last_distance_traveled_m: float = self.sensor.get_attr_safe_float(ATTR_DISTANCE_FROM_HOME_M)
+        proceed_with_update = 1
+
+        await self.update_location_attributes()
+        await self.calculate_distances()
+        await self.calculate_travel_distance()
+        await self.determine_direction_of_travel(last_distance_traveled_m)
+
+        _LOGGER.debug(
+            "(%s) Previous Location: %s",
+            self.sensor.get_attr(CONF_NAME),
+            self.sensor.get_attr(ATTR_LOCATION_PREVIOUS),
+        )
+        _LOGGER.debug(
+            "(%s) Current Location: %s",
+            self.sensor.get_attr(CONF_NAME),
+            self.sensor.get_attr(ATTR_LOCATION_CURRENT),
+        )
+        _LOGGER.debug(
+            "(%s) Home Location: %s",
+            self.sensor.get_attr(CONF_NAME),
+            self.sensor.get_attr(ATTR_HOME_LOCATION),
+        )
+        _LOGGER.info(
+            "(%s) Distance from home [%s]: %s km",
+            self.sensor.get_attr(CONF_NAME),
+            self.sensor.get_attr_safe_str(CONF_HOME_ZONE).split(".")[1],
+            self.sensor.get_attr(ATTR_DISTANCE_FROM_HOME_KM),
+        )
+        _LOGGER.info(
+            "(%s) Travel Direction: %s",
+            self.sensor.get_attr(CONF_NAME),
+            self.sensor.get_attr(ATTR_DIRECTION_OF_TRAVEL),
+        )
+        _LOGGER.info(
+            "(%s) Meters traveled since last update: %s",
+            self.sensor.get_attr(CONF_NAME),
+            round(self.sensor.get_attr_safe_float(ATTR_DISTANCE_TRAVELED_M), 1),
+        )
+
+        if (
+            not self.sensor.is_attr_blank(ATTR_LATITUDE)
+            and not self.sensor.is_attr_blank(ATTR_LONGITUDE)
+            and not self.sensor.is_attr_blank(ATTR_HOME_LATITUDE)
+            and not self.sensor.is_attr_blank(ATTR_HOME_LONGITUDE)
+        ):
+            return proceed_with_update
+
+        proceed_with_update = 0
+        _LOGGER.info(
+            "(%s) Problem with updated lat/long, not performing update: "
+            "old_latitude=%s, old_longitude=%s, "
+            "new_latitude=%s, new_longitude=%s, "
+            "home_latitude=%s, home_longitude=%s",
+            self.sensor.get_attr(CONF_NAME),
+            self.sensor.get_attr(ATTR_LATITUDE_OLD),
+            self.sensor.get_attr(ATTR_LONGITUDE_OLD),
+            self.sensor.get_attr(ATTR_LATITUDE),
+            self.sensor.get_attr(ATTR_LONGITUDE),
+            self.sensor.get_attr(ATTR_HOME_LATITUDE),
+            self.sensor.get_attr(ATTR_HOME_LONGITUDE),
+        )
         return proceed_with_update
 
     async def get_seconds_from_last_change(self, now: datetime) -> int:
@@ -996,9 +1018,7 @@ class PlacesUpdater:
             )
 
             cleared_state = clear_since_from_state(self.sensor.get_attr_safe_str(ATTR_NATIVE_VALUE))
-            self.sensor.set_native_value(
-                value=f"{cleared_state} (since {mmddstring})"
-            )
+            self.sensor.set_native_value(value=f"{cleared_state} (since {mmddstring})")
             self.sensor.set_attr(ATTR_SHOW_DATE, True)
             await self._hass.async_add_executor_job(
                 write_sensor_to_json,
