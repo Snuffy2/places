@@ -1,18 +1,14 @@
-from unittest.mock import AsyncMock, MagicMock
+"""Integration tests for the custom_components.places module.
+
+This module contains tests for setup and unload entry functions, ensuring correct interaction with Home Assistant's config entries and platform management.
+"""
+
+from unittest.mock import MagicMock
 
 import pytest
 
 from custom_components.places import async_setup_entry, async_unload_entry
-from custom_components.places.const import PLATFORMS  # <-- Add this import
-
-
-@pytest.fixture
-def mock_hass():
-    """Fixture that returns a MagicMock simulating the Home Assistant core object with mocked async methods for forwarding entry setups and unloading platforms."""
-    hass = MagicMock()
-    hass.config_entries.async_forward_entry_setups = AsyncMock(return_value=None)
-    hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
-    return hass
+from custom_components.places.const import PLATFORMS
 
 
 @pytest.fixture
@@ -30,6 +26,7 @@ def mock_entry():
 
 @pytest.mark.asyncio
 async def test_runtime_data_set_on_entry(mock_hass, mock_entry):
+    """Test that async_setup_entry sets runtime_data on the entry and calls async_forward_entry_setups once."""
     result = await async_setup_entry(mock_hass, mock_entry)
     assert result is True
     assert mock_entry.runtime_data == mock_entry.data
@@ -63,23 +60,13 @@ async def test_async_setup_entry_with_empty_data(mock_hass):
 
 
 @pytest.mark.asyncio
-async def test_async_unload_entry_success(mock_hass, mock_entry):
-    """Test that async_unload_entry returns True when platforms are successfully unloaded.
-
-    Verifies that async_unload_entry calls async_unload_platforms with the correct arguments and returns True on success.
-    """
-    mock_hass.config_entries.async_unload_platforms.return_value = True
+@pytest.mark.parametrize("unload_return,expected", [(True, True), (False, False)])
+async def test_async_unload_entry_result(mock_hass, mock_entry, unload_return, expected):
+    """Test that async_unload_entry returns the correct result based on platform unload success or failure."""
+    mock_hass.config_entries.async_unload_platforms.return_value = unload_return
     result = await async_unload_entry(mock_hass, mock_entry)
-    assert result is True
+    assert result is expected
     mock_hass.config_entries.async_unload_platforms.assert_called_once_with(mock_entry, PLATFORMS)
-
-
-@pytest.mark.asyncio
-async def test_async_unload_entry_failure(mock_hass, mock_entry):
-    """Test that `async_unload_entry` returns False when platform unloading fails."""
-    mock_hass.config_entries.async_unload_platforms.return_value = False
-    result = await async_unload_entry(mock_hass, mock_entry)
-    assert result is False
 
 
 @pytest.mark.asyncio

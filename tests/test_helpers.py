@@ -1,5 +1,16 @@
+"""Unit tests for helper functions in the places custom component.
+
+This module tests:
+- Folder creation and file operations for JSON files
+- Type checking utilities
+- Sensor data serialization
+- String manipulation helpers
+"""
+
 from datetime import datetime
 import json
+
+import pytest
 
 from custom_components.places.helpers import (
     clear_since_from_state,
@@ -13,12 +24,14 @@ from custom_components.places.helpers import (
 
 
 def test_create_json_folder_creates(tmp_path):
+    """Test that create_json_folder creates the specified folder."""
     folder = tmp_path / "json_folder"
     create_json_folder(str(folder))
     assert folder.exists() and folder.is_dir()
 
 
 def test_create_json_folder_existing(tmp_path):
+    """Test that create_json_folder does not raise when the folder already exists."""
     folder = tmp_path / "json_folder"
     folder.mkdir()
     create_json_folder(str(folder))  # Should not raise
@@ -37,6 +50,7 @@ def test_get_dict_from_json_file_reads(tmp_path):
 
 
 def test_get_dict_from_json_file_missing(tmp_path):
+    """Test that get_dict_from_json_file returns an empty dictionary when the JSON file is missing."""
     folder = tmp_path
     filename = "missing.json"
     result = get_dict_from_json_file("test", filename, str(folder))
@@ -44,6 +58,7 @@ def test_get_dict_from_json_file_missing(tmp_path):
 
 
 def test_remove_json_file_removes(tmp_path):
+    """Test that remove_json_file deletes the specified JSON file if it exists."""
     folder = tmp_path
     filename = "toremove.json"
     file_path = folder / filename
@@ -54,6 +69,7 @@ def test_remove_json_file_removes(tmp_path):
 
 
 def test_remove_json_file_missing(tmp_path):
+    """Test that remove_json_file does not raise when the specified JSON file is missing."""
     folder = tmp_path
     filename = "missing.json"
     # Should not raise
@@ -61,6 +77,7 @@ def test_remove_json_file_missing(tmp_path):
 
 
 def test_is_float_true_for_float():
+    """Test that is_float returns True for valid float values and float-like strings."""
     assert is_float(1.23)
     assert is_float("2.34")
     assert is_float(0)
@@ -69,6 +86,7 @@ def test_is_float_true_for_float():
 
 
 def test_is_float_false_for_non_float():
+    """Test that is_float returns False for values that are not floats or float-like strings."""
     assert not is_float(None)
     assert not is_float("abc")
     assert not is_float({})
@@ -89,6 +107,7 @@ def test_write_sensor_to_json_excludes_datetime(tmp_path):
 
 
 def test_clear_since_from_state_removes_pattern():
+    """Test that clear_since_from_state removes '(since ...)' patterns from strings."""
     s = "Home (since 12:34)"
     assert clear_since_from_state(s) == "Home"
     s2 = "Work (since 01/23)"
@@ -97,17 +116,15 @@ def test_clear_since_from_state_removes_pattern():
     assert clear_since_from_state(s3) == "Elsewhere"
 
 
-def test_safe_truncate_shorter():
-    assert safe_truncate("abc", 5) == "abc"
-
-
-def test_safe_truncate_exact():
-    assert safe_truncate("abcde", 5) == "abcde"
-
-
-def test_safe_truncate_longer():
-    assert safe_truncate("abcdef", 4) == "abcd"
-
-
-def test_safe_truncate_none():
-    assert safe_truncate(None, 3) == ""
+@pytest.mark.parametrize(
+    "input_str,max_len,expected",
+    [
+        ("abc", 5, "abc"),  # shorter
+        ("abcde", 5, "abcde"),  # exact
+        ("abcdef", 4, "abcd"),  # longer
+        (None, 3, ""),  # None
+    ],
+)
+def test_safe_truncate(input_str, max_len, expected):
+    """Test that safe_truncate returns the correct truncated string for various input scenarios."""
+    assert safe_truncate(input_str, max_len) == expected
