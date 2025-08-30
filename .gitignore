@@ -1,9 +1,12 @@
 __pycache__
 .coverage
+.coverage.*
 .DS_Store
 .env
-.mypy
-.ruff
+.mypy_cache
+.pytest_cache
+.qodo
+.ruff_cache
 .tox
 .venv
 .vscode
@@ -15,10 +18,11 @@ __pycache__
 /pyvenv.cfg
 $RECYCLE.BIN/
 coverage.xml
-custom_components/*/__pycache__/
 env.bak/
 env/
 ENV/
+htmlcov/
+junit.xml
 pytest.xml
 pythonenv*
 Thumbs.db

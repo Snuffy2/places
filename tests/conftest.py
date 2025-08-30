@@ -1,26 +1,41 @@
 """Pytest fixtures and mock classes for testing Home Assistant integrations."""
 
-from unittest.mock import AsyncMock, MagicMock
+from contextlib import contextmanager, suppress
+from typing import cast
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
+from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+from custom_components.places.update_sensor import PlacesUpdater
+from homeassistant.core import HomeAssistant
+import homeassistant.helpers.entity_registry as er
 
 
-class MockMethod:
-    """Callable mock supporting a default function, return_value, and side_effect."""
+def MockMethod(default_func):
+    """Return a Mock that calls default_func when not overridden by side_effect/return_value.
 
-    def __init__(self, default_func):
-        """Initialize with a default callable used when no return_value/side_effect set."""
-        self._default_func = default_func
-        self.return_value = None
-        self.side_effect = None
+    This preserves previous tests' ability to set `.side_effect` or `.return_value` while
+    defaulting to calling `default_func` when neither is provided.
+    """
+    m = Mock()
+    # Ensure the mock has no implicit return_value (Mock() sets a Mock by default),
+    # so that our side_effect will call the default_func unless a test explicitly
+    # assigns m.return_value to a concrete value.
+    m.return_value = None
 
-    def __call__(self, *args, **kwargs):
-        """Invoke side_effect, return_value, or the default function with provided args."""
-        if self.side_effect is not None:
-            return self.side_effect(*args, **kwargs)
-        if self.return_value is not None:
-            return self.return_value
-        return self._default_func(*args, **kwargs)
+    # Use a side_effect that prefers a user-set non-None return_value, but
+    # otherwise falls back to calling the provided default function. If a test
+    # sets .side_effect on the mock after creation, that will override this.
+    def _side_effect(*args, **kwargs):
+        # Respect an explicit non-None return_value set by the test
+        ret = getattr(m, "return_value", None)
+        if ret is not None:
+            return ret
+        return default_func(*args, **kwargs)
+
+    m.side_effect = _side_effect
+    return m
 
 
 class MockSensor:
@@ -165,15 +180,6 @@ class MockSensor:
         return self._in_zone
 
 
-class MockState:
-    """Simple mock of a Home Assistant state with entity_id and attributes."""
-
-    def __init__(self, entity_id, attributes):
-        """Store entity_id and attributes on the mock state."""
-        self.entity_id = entity_id
-        self.attributes = attributes
-
-
 @pytest.fixture(name="mock_hass")
 def mock_hass():
     """Provide a mock Home Assistant instance configured with common attributes."""
@@ -201,52 +207,225 @@ def mock_hass():
     hass_instance.states = MagicMock()
     hass_instance.data = {}
     hass_instance.async_add_executor_job = AsyncMock()
+    # Prevent entity registry lookups from expecting a full HA runtime in unit tests
+    # Use the typed dummy entity-registry provider to satisfy static typing.
+    er.async_get = _async_get_entity_registry
     return hass_instance
 
 
-class FakeResp:
-    """Fake aiohttp response exposing an async .text() method."""
-
-    def __init__(self, text):
-        """Store the response payload text."""
-        self._text = text
-
-    async def text(self):
-        """Return the stored payload text."""
-        return self._text
+class _DummyRegistry:
+    def async_get_entity_id(self, domain, platform, unique_id):
+        return None
 
 
-class FakeCM:
-    """Async context manager that yields a FakeResp for use with "async with"."""
-
-    def __init__(self, resp: FakeResp):
-        """Create the context manager that will yield the provided FakeResp."""
-        self._resp = resp
-
-    async def __aenter__(self):
-        """Return the underlying FakeResp when entering the async context."""
-        return self._resp
-
-    async def __aexit__(self, exc_type, exc, tb):
-        """Exit the async context; do not suppress exceptions."""
-        return False
+def _async_get_entity_registry(hass: HomeAssistant) -> er.EntityRegistry:
+    """Return a minimal, typed dummy EntityRegistry for tests."""
+    return cast("er.EntityRegistry", _DummyRegistry())
 
 
-class FakeSession:
-    """Fake aiohttp ClientSession-like object for tests with async context support."""
+def mock_sensor(attrs=None, display_options_list=None, blank_attrs=None, in_zone=False):
+    """Factory function that returns a configured MockSensor.
 
-    def __init__(self, resp: FakeResp, *a, **kw):
-        """Store the FakeResp to be returned by get()."""
-        self._resp = resp
+    Usage in tests:
+        sensor = mock_sensor()
+        sensor = mock_sensor(attrs={...}, in_zone=True)
+    """
+    return MockSensor(
+        attrs=attrs,
+        display_options_list=display_options_list,
+        blank_attrs=blank_attrs,
+        in_zone=in_zone,
+    )
 
-    async def __aenter__(self):
-        """Return the fake session when entering the async context."""
-        return self
 
-    async def __aexit__(self, exc_type, exc, tb):
-        """Exit the async context; no cleanup performed."""
-        return False
+@pytest.fixture
+def sensor():
+    """Provide a fresh MockSensor instance for tests via fixture."""
+    return mock_sensor()
 
-    def get(self, *a, **kw):
-        """Return a FakeCM that yields the stored FakeResp when entered."""
-        return FakeCM(self._resp)
+
+@pytest.fixture
+def updater_instance(mock_hass):
+    """Provide a PlacesUpdater instance wired to the shared `mock_hass` and a fresh sensor."""
+    sensor_obj = mock_sensor()
+    return PlacesUpdater(mock_hass, MockConfigEntry(domain="places", data={}), sensor_obj)
+
+
+@pytest.fixture
+def updater(mock_hass):
+    """Provide a PlacesUpdater instance using the shared `mock_hass` and a fresh mock_sensor.
+
+    Returns a PlacesUpdater constructed with a fresh mock_sensor.
+    """
+    sensor = mock_sensor()
+    return PlacesUpdater(mock_hass, MockConfigEntry(domain="places", data={}), sensor)
+
+
+@pytest.fixture
+def prepared_updater(monkeypatch):
+    """Provide a MagicMock updater and patch PlacesUpdater to return it while recording init calls.
+
+    The fixture returns the MagicMock instance. The fixture attaches an `_init_calls` list
+    to the mock where each instantiation call's (args, kwargs) is appended. Tests can
+    assert on `_init_calls` to verify instantiation parameters.
+    """
+    mock_updater = MagicMock()
+    init_calls = []
+
+    def _creator(*args, **kwargs):
+        init_calls.append((args, kwargs))
+        return mock_updater
+
+    # Patch the PlacesUpdater constructor used in tests
+    monkeypatch.setattr("custom_components.places.sensor.PlacesUpdater", _creator)
+    # Attach the calls list for test assertions
+    mock_updater._init_calls = init_calls
+    return mock_updater
+
+
+@pytest.fixture
+def patch_entity_registry():
+    """Patch er.async_get to return a minimal dummy EntityRegistry for the duration of a test.
+
+    This fixture temporarily replaces the entity registry getter so tests that rely on a
+    patched registry can run without requiring a full Home Assistant runtime.
+    """
+    original = er.async_get
+    er.async_get = _async_get_entity_registry
+    try:
+        yield _async_get_entity_registry
+    finally:
+        er.async_get = original
+
+
+def stub_in_zone(obj, return_value: bool):
+    """Return a context manager that temporarily stubs an object's async `in_zone` method.
+
+    Usage:
+        with stub_in_zone(sensor, False):
+            await sensor.process_display_options()
+    """
+    return patch.object(obj, "in_zone", AsyncMock(return_value=return_value))
+
+
+def stub_method(
+    obj, method_name: str, *, return_value=None, side_effect=None, async_method: bool = True
+):
+    """Return a context manager that temporarily stubs an object's method.
+
+    Parameters:
+        obj: target object
+        method_name: attribute name to patch
+        return_value: value to return from the stub
+        side_effect: callable to use as side_effect
+        async_method: whether to patch with AsyncMock (True) or MagicMock (False)
+
+    Usage:
+        with stub_method(parser, "parse_type", return_value=None):
+            await parser.parse_osm_dict()
+
+    """
+    # Create the appropriate mock object and assign it to the target attribute.
+    if async_method:
+        mocker = AsyncMock(return_value=return_value)
+        if side_effect is not None:
+            mocker.side_effect = side_effect
+    else:
+        mocker = MagicMock(return_value=return_value)
+        if side_effect is not None:
+            mocker.side_effect = side_effect
+
+    # Use a simple context manager that attaches the mock to the object and
+    # leaves it in place so tests can assert against the attribute after the
+    # with-block (many existing tests expect the mock to be present after use).
+    @contextmanager
+    def _cm():
+        setattr(obj, method_name, mocker)
+        try:
+            yield mocker
+        finally:
+            # Intentionally do not restore original to preserve test assertions
+            # which expect the mock to remain assigned for inspection.
+            pass
+
+    return _cm()
+
+
+@pytest.fixture
+def stubbed_updater():
+    """Provide a helper that returns a context manager for stubbing multiple updater methods.
+
+    Usage:
+        with stubbed_updater(updater, [
+            ("get_current_time", {"return_value": dt}),
+            ("update_previous_state", {}),
+        ]):
+            await updater.do_update(...)
+
+    Each tuple is (method_name, kwargs) where kwargs match stub_method's signature.
+    """
+
+    def _create(updater, methods):
+        cms = [stub_method(updater, method_name, **kwargs) for method_name, kwargs in methods]
+
+        @contextmanager
+        def _cm():
+            # Enter all context managers and yield a list of mocks
+            entered = [cm.__enter__() for cm in cms]
+            try:
+                yield entered
+            finally:
+                # No-op for exits because stub_method intentionally doesn't restore
+                for cm in cms:
+                    with suppress(Exception):
+                        cm.__exit__(None, None, None)
+
+        return _cm()
+
+    return _create
+
+
+def stubbed_parser(parser, methods):
+    """Return a context manager for stubbing multiple parser methods.
+
+    Usage:
+        with stubbed_parser(parser, [("parse_type", {}), ("set_attribution", {})]):
+            await parser.parse_osm_dict()
+    """
+
+    cms = [stub_method(parser, method_name, **kwargs) for method_name, kwargs in methods]
+
+    @contextmanager
+    def _cm():
+        entered = [cm.__enter__() for cm in cms]
+        try:
+            yield entered
+        finally:
+            for cm in cms:
+                with suppress(Exception):
+                    cm.__exit__(None, None, None)
+
+    return _cm()
+
+
+def stubbed_sensor(sensor_obj, methods):
+    """Return a context manager for stubbing multiple sensor methods.
+
+    Usage:
+        with stubbed_sensor(sensor, [("process_display_options", {})]):
+            await Places.process_display_options(sensor)
+    """
+
+    cms = [stub_method(sensor_obj, method_name, **kwargs) for method_name, kwargs in methods]
+
+    @contextmanager
+    def _cm():
+        entered = [cm.__enter__() for cm in cms]
+        try:
+            yield entered
+        finally:
+            for cm in cms:
+                with suppress(Exception):
+                    cm.__exit__(None, None, None)
+
+    return _cm()

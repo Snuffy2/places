@@ -56,7 +56,7 @@ ignore_missing_imports = true
 disallow_untyped_defs = false
 disallow_untyped_calls = false
 disallow_incomplete_defs = false
-disable_error_code = ["arg-type", "method-assign", "no-untyped-def", "index", "union-attr", "operator"]
+disable_error_code = ["import-untyped", "arg-type", "method-assign", "no-untyped-def", "index", "union-attr", "operator"]
 check_untyped_defs = false
 warn_unused_ignores = false
 
