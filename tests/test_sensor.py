@@ -17,8 +17,7 @@ from custom_components.places.const import (
     ATTR_PLACE_TYPE,
 )
 from custom_components.places.sensor import EVENT_TYPE, RECORDER_INSTANCE, Places, async_setup_entry
-
-from .conftest import stub_in_zone, stub_method, stubbed_parser
+from tests.conftest import stub_in_zone, stub_method, stubbed_parser
 
 
 @pytest.fixture
@@ -87,30 +86,31 @@ def test_extra_state_attributes_basic(monkeypatch, places_instance):
     monkeypatch.setattr("custom_components.places.sensor.EXTENDED_ATTRIBUTE_LIST", ["baz", "qux"])
     monkeypatch.setattr("custom_components.places.sensor.CONF_EXTENDED_ATTR", "extended")
 
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("tracker_id", ["device.tracker_1", "device.tracker_2"])
-    async def test_async_added_to_hass_param(monkeypatch, places_instance, tracker_id):
-        """Parametrized: async_added_to_hass subscribes to the configured tracker id and registers the removal callback."""
-        with (
-            patch(
-                "custom_components.places.sensor.async_track_state_change_event",
-                return_value="remove_handle",
-            ) as track_event,
-            patch("custom_components.places.sensor._LOGGER") as logger,
-        ):
-            places_instance.get_attr = MagicMock(return_value=tracker_id)
-            places_instance.tsc_update = MagicMock()
-            places_instance.async_on_remove = MagicMock()
 
-            await places_instance.async_added_to_hass()
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tracker_id", ["device.tracker_1", "device.tracker_2"])
+async def test_async_added_to_hass_param(monkeypatch, places_instance, tracker_id):
+    """Parametrized: async_added_to_hass subscribes to the configured tracker id and registers the removal callback."""
+    with (
+        patch(
+            "custom_components.places.sensor.async_track_state_change_event",
+            return_value="remove_handle",
+        ) as track_event,
+        patch("custom_components.places.sensor._LOGGER") as logger,
+    ):
+        places_instance.get_attr = MagicMock(return_value=tracker_id)
+        places_instance.tsc_update = MagicMock()
+        places_instance.async_on_remove = MagicMock()
 
-            track_event.assert_called_once_with(
-                places_instance._hass,
-                [tracker_id],
-                places_instance.tsc_update,
-            )
-            places_instance.async_on_remove.assert_called_once_with("remove_handle")
-            logger.debug.assert_called()
+        await places_instance.async_added_to_hass()
+
+        track_event.assert_called_once_with(
+            places_instance._hass,
+            [tracker_id],
+            places_instance.tsc_update,
+        )
+        places_instance.async_on_remove.assert_called_once_with("remove_handle")
+        logger.debug.assert_called()
 
 
 def test_get_internal_attr_returns_dict(places_instance):
@@ -441,32 +441,6 @@ def test_exclude_event_types_param(monkeypatch, recorder_present, expected_in_se
         assert EVENT_TYPE in recorder.exclude_event_types
     else:
         assert RECORDER_INSTANCE not in hass.data
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("tracker_id", ["device.tracker_1", "device.tracker_2"])
-async def test_async_added_to_hass_param(monkeypatch, places_instance, tracker_id):
-    """Parametrized: async_added_to_hass subscribes to the configured tracker id and registers the removal callback."""
-    with (
-        patch(
-            "custom_components.places.sensor.async_track_state_change_event",
-            return_value="remove_handle",
-        ) as track_event,
-        patch("custom_components.places.sensor._LOGGER") as logger,
-    ):
-        places_instance.get_attr = MagicMock(return_value=tracker_id)
-        places_instance.tsc_update = MagicMock()
-        places_instance.async_on_remove = MagicMock()
-
-        await places_instance.async_added_to_hass()
-
-        track_event.assert_called_once_with(
-            places_instance._hass,
-            [tracker_id],
-            places_instance.tsc_update,
-        )
-        places_instance.async_on_remove.assert_called_once_with("remove_handle")
-        logger.debug.assert_called()
 
 
 @pytest.mark.asyncio
