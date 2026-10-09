@@ -21,6 +21,7 @@ from homeassistant.const import (
     CONF_NAME,
     CONF_ZONE,
 )
+from homeassistant.core import State
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -28,6 +29,7 @@ from custom_components.places.const import (
     ATTR_DEVICETRACKER_ZONE,
     ATTR_DEVICETRACKER_ZONE_NAME,
     ATTR_DIRECTION_OF_TRAVEL,
+    ATTR_DISPLAY_OPTIONS,
     ATTR_DISTANCE_FROM_HOME,
     ATTR_DISTANCE_TRAVELED,
     ATTR_HOME_LATITUDE,
@@ -56,6 +58,7 @@ from custom_components.places.const import (
     ATTR_WIKIDATA_ID,
     CONF_DATE_FORMAT,
     CONF_DEVICETRACKER_ID,
+    CONF_DISPLAY_OPTIONS,
     CONF_EXTENDED_ATTR,
     CONF_HOME_ZONE,
     CONF_LANGUAGE,
@@ -68,6 +71,7 @@ from custom_components.places.const import (
     OSM_THROTTLE_INTERVAL_SECONDS,
     UpdateStatus,
 )
+from custom_components.places.osm_client import OSMClient
 from custom_components.places.sensor import Places
 from custom_components.places.update_sensor import PlacesUpdater
 from tests.conftest import (
@@ -133,6 +137,102 @@ def register_aioclient(aioclient_mock: AioClientMock, url: str, **kwargs: object
         aioclient_mock.get(url.rstrip("/"), **kwargs)
     else:
         aioclient_mock.get(f"{url}/", **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("show_time", [False, True])
+@pytest.mark.parametrize("extended", [False, True])
+async def test_movement_refreshes_location_with_unchanged_display(
+    mock_hass: MagicMock,
+    coordinator_factory: CoordinatorFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    show_time: bool,
+    extended: bool,
+) -> None:
+    """Publish fresh location data independently of display changes and failed lookups.
+
+    Args:
+        mock_hass (MagicMock): Mocked Home Assistant runtime.
+        coordinator_factory (CoordinatorFactory): Factory for a real coordinator.
+        monkeypatch (pytest.MonkeyPatch): Scoped external lookup and clock replacements.
+        show_time (bool): Whether to append the display's since time.
+        extended (bool): Whether to fetch extended OSM details.
+    """
+    mock_hass.config.time_zone = "UTC"
+    states = {
+        "zone.home": State("zone.home", "0", {"latitude": 51.4, "longitude": -0.1}),
+        "device_tracker.test": State(
+            "device_tracker.test",
+            "not_home",
+            {"latitude": 51.5, "longitude": -0.1, "gps_accuracy": 5},
+        ),
+    }
+    mock_hass.states.get.side_effect = states.get
+    mock_hass.data = {DOMAIN: {OSM_CACHE: {}}}
+    _, coordinator = coordinator_factory("Probe")
+    persist = AsyncMock()
+    monkeypatch.setattr(coordinator._persistence, "async_save", persist)
+    coordinator.set_attr(CONF_DISPLAY_OPTIONS, "city")
+    coordinator.set_attr(ATTR_DISPLAY_OPTIONS, "city")
+    coordinator.set_attr(CONF_SHOW_TIME, show_time)
+    coordinator.set_attr(CONF_EXTENDED_ATTR, extended)
+    monkeypatch.setattr(
+        PlacesUpdater,
+        "get_current_time",
+        AsyncMock(side_effect=[datetime(2024, 1, 1, hour, tzinfo=UTC) for hour in range(12, 16)]),
+    )
+    payload = {
+        "osm_id": 1,
+        "osm_type": "node",
+        "category": "place",
+        "type": "city",
+        "address": {"city": "London", "country": "United Kingdom", "country_code": "gb"},
+    }
+    lookup = AsyncMock(return_value=payload)
+    monkeypatch.setattr(OSMClient, "get_json", lookup)
+    await coordinator._run_update("Test")
+    original_state = coordinator.data.native_value
+    original_changed = coordinator.data.attributes[ATTR_LAST_CHANGED]
+    original_link = coordinator.data.attributes[ATTR_MAP_LINK]
+    mock_hass.bus.fire.reset_mock()
+
+    states["device_tracker.test"] = State(
+        "device_tracker.test",
+        "not_home",
+        {"latitude": 51.6, "longitude": -0.1, "gps_accuracy": 5},
+    )
+    payload["osm_id"] = 2
+    await coordinator._run_update("Test")
+    assert coordinator.data.native_value == original_state
+    assert coordinator.data.attributes[ATTR_LAST_CHANGED] == original_changed
+    assert coordinator.data.attributes[ATTR_LATITUDE] == 51.6
+    assert coordinator.data.attributes[ATTR_MAP_LINK] != original_link
+    assert coordinator.data.attributes[ATTR_OSM_ID] == "2"
+    if extended:
+        assert coordinator.data.attributes[ATTR_OSM_DETAILS_DICT]["osm_id"] == 2
+    assert coordinator.data.attributes[ATTR_LAST_UPDATED] == "2024-01-01 13:00:00+00:00"
+    assert persist.call_args.args[0][ATTR_LATITUDE] == 51.6
+    mock_hass.bus.fire.assert_not_called()
+
+    states["device_tracker.test"] = State(
+        "device_tracker.test",
+        "not_home",
+        {"latitude": 51.7, "longitude": -0.1, "gps_accuracy": 5},
+    )
+    lookup.return_value = None
+    await coordinator.async_force_update()
+    assert coordinator.data.native_value == original_state
+    assert coordinator.data.attributes[ATTR_LATITUDE] == 51.6
+    assert coordinator.data.attributes[ATTR_LAST_CHANGED] == original_changed
+    mock_hass.bus.fire.assert_not_called()
+
+    payload["address"]["city"] = "Oxford"
+    lookup.return_value = payload
+    await coordinator._run_update("Test")
+    assert coordinator.data.native_value == ("Oxford (since 15:00)" if show_time else "Oxford")
+    assert coordinator.data.attributes[ATTR_LATITUDE] == 51.7
+    assert coordinator.data.attributes[ATTR_LAST_CHANGED] == "2024-01-01 15:00:00+00:00"
+    mock_hass.bus.fire.assert_called_once()
 
 
 @pytest.mark.asyncio

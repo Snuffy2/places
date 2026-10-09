@@ -126,8 +126,8 @@ class PlacesUpdater:
                 Human-readable trigger reason used in logs.
             previous_attr (MutableMapping[str, Any]):
                 Attribute snapshot captured before the update, used
-                for rollback when criteria fail or the rendered state is
-                unchanged.
+                for rollback when criteria fail and to preserve display timing
+                when a successful lookup leaves the rendered state unchanged.
             force (bool):
                 Whether to bypass update criteria and cached response reads.
 
@@ -168,17 +168,23 @@ class PlacesUpdater:
                         await self.handle_state_update(
                             now=now, prev_last_place_name=prev_last_place_name
                         )
-                else:
-                    _LOGGER.info(
-                        "(%s) No entity update needed, Previous State = New State",
-                        coordinator.get_attr(CONF_NAME),
-                    )
+                elif coordinator.is_attr_blank(ATTR_OSM_DICT):
                     await self.rollback_update(
                         previous_attr,
                         now,
                         proceed_with_update,
                         preserve_zone_attrs=True,
                     )
+                else:
+                    _LOGGER.info(
+                        "(%s) Refreshing location data without changing the display state",
+                        coordinator.get_attr(CONF_NAME),
+                    )
+                    if coordinator.get_attr(CONF_EXTENDED_ATTR):
+                        await self.get_extended_attr()
+                    coordinator.set_native_value(previous_attr.get(ATTR_NATIVE_VALUE))
+                    coordinator.set_attr(ATTR_LAST_CHANGED, previous_attr.get(ATTR_LAST_CHANGED))
+                    await coordinator.async_cleanup_attributes()
             else:
                 await self.rollback_update(
                     previous_attr,
