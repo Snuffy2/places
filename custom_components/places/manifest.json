@@ -23,6 +23,9 @@
   "integration_type": "device",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/custom-components/places/issues",
+  "loggers": [
+    "aioplaces"
+  ],
   "requirements": [
     "aioplaces==0.1.1"
   ],
