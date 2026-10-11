@@ -73,6 +73,10 @@ jobs:
         if: steps.versions.outputs.update_needed == 'true'
         run: uv lock
 
+      - name: Run tests with the updated dependency lock
+        if: steps.versions.outputs.update_needed == 'true'
+        run: uv run --locked --group pytest pytest
+
       - name: Build aioplaces release notes
         if: steps.versions.outputs.update_needed == 'true'
         env:
