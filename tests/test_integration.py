@@ -6,13 +6,12 @@ import logging
 from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
-import cachetools
+from aioplaces import PlacesClient
 from homeassistant.components.recorder import DATA_INSTANCE
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.places import (
-    _ensure_osm_runtime_state,
     async_migrate_entry,
     async_remove_entry,
     async_remove_extended_entity,
@@ -33,8 +32,7 @@ from custom_components.places.const import (
     CONF_SHOW_TIME,
     DEFAULT_DISPLAY_OPTIONS,
     DOMAIN,
-    OSM_CACHE,
-    OSM_THROTTLE,
+    PLACES_CLIENT,
     PLATFORMS,
 )
 from custom_components.places.coordinator import PlacesUpdateCoordinator
@@ -612,9 +610,7 @@ async def test_async_setup_entry_calls_forward_setups(
 
     assert result is True
     assert isinstance(mock_entry.runtime_data, _FakeCoordinator)
-    assert isinstance(mock_hass.data[DOMAIN][OSM_CACHE], cachetools.TTLCache)
-    assert isinstance(mock_hass.data[DOMAIN][OSM_THROTTLE]["lock"], asyncio.Lock)
-    assert mock_hass.data[DOMAIN][OSM_THROTTLE]["last_query"] == 0.0
+    assert isinstance(mock_hass.data[DOMAIN][PLACES_CLIENT], PlacesClient)
     assert _FakeSetupPlacesStorage.instances[0].entry_id == mock_entry.entry_id
     assert _FakeSetupPlacesStorage.instances[0].name == mock_entry.data[CONF_NAME]
     assert mock_entry.runtime_data.imported_attributes == {"native_value": "Restored"}
@@ -716,28 +712,6 @@ async def test_async_setup_entry_renders_current_options_from_persisted_location
     await async_setup_entry(mock_hass, entry)
 
     assert entry.runtime_data.data.native_value == expected_state
-
-
-def test_ensure_osm_runtime_state_preserves_existing_state(mock_hass: MagicMock) -> None:
-    """OSM runtime setup should not replace existing shared cache or throttle.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-    """
-    cache: dict[str, object] = {"cached": {"ok": True}}
-    throttle = {"lock": asyncio.Lock(), "last_query": 42.0}
-    mock_hass.data = {
-        DOMAIN: {
-            OSM_CACHE: cache,
-            OSM_THROTTLE: throttle,
-        }
-    }
-
-    _ensure_osm_runtime_state(mock_hass)
-
-    assert mock_hass.data[DOMAIN][OSM_CACHE] is cache
-    assert mock_hass.data[DOMAIN][OSM_THROTTLE] is throttle
 
 
 @pytest.mark.asyncio

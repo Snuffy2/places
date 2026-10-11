@@ -184,6 +184,20 @@ wheels = [
 ]
 
 [[package]]
+name = "aioplaces"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "cachetools" },
+    { name = "yarl" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/29/12/49e561066fffbc550c76415c7d19238d47cb97097b2ffab7cca92549f39f/aioplaces-0.1.1.tar.gz", hash = "sha256:36c40751029a6676c7c00ce71cc1560cb62ab12603a4636be5590e85bf2502fa", size = 44174, upload-time = "2026-10-11T23:09:49.139Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ba/90/43baccd1c4b629210faa55522e2b9cc622ef18bfdd6a93c8c8e99d13b6f2/aioplaces-0.1.1-py3-none-any.whl", hash = "sha256:5e57835a1c898a6292dabba0c51140ac07fee388173950b82cf82e73a368e446", size = 25891, upload-time = "2026-10-11T23:09:47.862Z" },
+]
+
+[[package]]
 name = "aiosignal"
 version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1957,8 +1971,7 @@ wheels = [
 name = "places"
 source = { virtual = "." }
 dependencies = [
-    { name = "aiohttp" },
-    { name = "cachetools" },
+    { name = "aioplaces" },
 ]
 
 [package.dev-dependencies]
@@ -1972,7 +1985,6 @@ dev = [
     { name = "pytest-homeassistant-custom-component" },
     { name = "pytest-timeout" },
     { name = "ruff" },
-    { name = "types-cachetools" },
     { name = "types-cffi" },
     { name = "types-greenlet" },
     { name = "types-pymysql" },
@@ -1991,7 +2003,6 @@ lint = [
     { name = "mypy" },
     { name = "prek" },
     { name = "ruff" },
-    { name = "types-cachetools" },
     { name = "types-cffi" },
     { name = "types-greenlet" },
     { name = "types-pymysql" },
@@ -2012,10 +2023,7 @@ pytest = [
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "aiohttp" },
-    { name = "cachetools" },
-]
+requires-dist = [{ name = "aioplaces", specifier = "==0.1.1" }]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2028,7 +2036,6 @@ dev = [
     { name = "pytest-homeassistant-custom-component", specifier = ">=0.13.317" },
     { name = "pytest-timeout" },
     { name = "ruff" },
-    { name = "types-cachetools" },
     { name = "types-cffi" },
     { name = "types-greenlet" },
     { name = "types-pymysql" },
@@ -2045,7 +2052,6 @@ lint = [
     { name = "mypy" },
     { name = "prek" },
     { name = "ruff" },
-    { name = "types-cachetools" },
     { name = "types-cffi" },
     { name = "types-greenlet" },
     { name = "types-pymysql" },
@@ -3089,15 +3095,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/53/a3/1585216310e344e8102c22482f6060c7a6ea0322b63e026372e6dcefcfd6/truststore-0.10.4.tar.gz", hash = "sha256:9d91bd436463ad5e4ee4aba766628dd6cd7010cf3e2461756b3303710eebc301", size = 26169, upload-time = "2025-08-12T18:49:02.73Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/19/97/56608b2249fe206a67cd573bc93cd9896e1efb9e98bce9c163bcdc704b88/truststore-0.10.4-py3-none-any.whl", hash = "sha256:adaeaecf1cbb5f4de3b1959b42d41f6fab57b2b1666adb59e89cb0b53361d981", size = 18660, upload-time = "2025-08-12T18:49:01.46Z" },
-]
-
-[[package]]
-name = "types-cachetools"
-version = "7.0.0.20260713"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/34/64/66d7efdb36ecf6826aca5415e59fe2df96e97d24157147e53acfbe8dda11/types_cachetools-7.0.0.20260713.tar.gz", hash = "sha256:f1acf079e9c66a81e096a897ef0b261a82117cf856834e37b4bd0c9a116a076a", size = 10199, upload-time = "2026-07-13T05:22:21.845Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/0e/c7/d3525c9dbdc1be7786bad46655ef051b6e7993f656d304719ec40079c91c/types_cachetools-7.0.0.20260713-py3-none-any.whl", hash = "sha256:6db9bcc7a3840d39e91c04117d85a9d0937eacc9d14d12a873e2b01a2d24a71d", size = 9615, upload-time = "2026-07-13T05:22:20.76Z" },
 ]
 
 [[package]]
