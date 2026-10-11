@@ -255,17 +255,23 @@ async def test_places_client_caches_success_and_force_fetches_fresh_data(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "no_result_text",
+    ["[]", '{"error": "Unable to geocode"}'],
+    ids=("empty-list", "error-object"),
+)
 async def test_places_client_retries_after_valid_no_result(
-    hass: HomeAssistant, aioclient_mock: AioClientMock
+    hass: HomeAssistant, aioclient_mock: AioClientMock, no_result_text: str
 ) -> None:
-    """A valid empty response does not suppress retrying the same coordinates.
+    """Valid no-result responses do not suppress retries for the same coordinates.
 
     Args:
         hass (HomeAssistant): Runtime providing the shared session.
         aioclient_mock (AioClientMock): HTTP boundary with sequential replies.
+        no_result_text (str): Empty-list or error-object response body.
     """
     url = _reverse_url()
-    no_result = aioclient_mock.request("get", url, text="[]")
+    no_result = aioclient_mock.request("get", url, text=no_result_text)
     recovered_payload: JSONMapping = {"osm_id": 456, "display_name": "Recovery"}
     recovered = aioclient_mock.request("get", url, json=recovered_payload)
     _sequence_responses(no_result, [no_result, recovered])
