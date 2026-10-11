@@ -15,6 +15,7 @@ from custom_components.places import (
     async_migrate_entry,
     async_remove_entry,
     async_remove_extended_entity,
+    async_setup,
     async_setup_entry,
     async_unload_entry,
 )
@@ -1513,3 +1514,56 @@ async def test_async_unload_entry_does_not_remove_store_data(
     await async_unload_entry(mock_hass, mock_entry)
 
     assert _FakePlacesStorage.remove_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("places_level", "library_level", "client_level", "expected_library_level", "debug_visible"),
+    [
+        (logging.DEBUG, logging.NOTSET, logging.NOTSET, logging.DEBUG, True),
+        (logging.DEBUG, logging.WARNING, logging.NOTSET, logging.WARNING, False),
+        (logging.NOTSET, logging.NOTSET, logging.NOTSET, logging.NOTSET, False),
+        (logging.DEBUG, logging.NOTSET, logging.WARNING, logging.DEBUG, False),
+    ],
+    ids=["inherit-debug", "explicit-library", "unset-integration", "explicit-client"],
+)
+async def test_async_setup_aligns_library_logging(
+    mock_hass: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+    places_level: int,
+    library_level: int,
+    client_level: int,
+    expected_library_level: int,
+    debug_visible: bool,
+) -> None:
+    """Apply default library logging while honoring explicit logger settings.
+
+    Args:
+        mock_hass (MagicMock): Mocked Home Assistant runtime.
+        caplog (pytest.LogCaptureFixture): Captured library log messages.
+        places_level (int): Configured Places integration level.
+        library_level (int): Configured library parent level.
+        client_level (int): Configured library client level.
+        expected_library_level (int): Library parent level after setup.
+        debug_visible (bool): Whether client debug output should be visible.
+    """
+    places_logger = logging.getLogger("custom_components.places")
+    library_logger = logging.getLogger("aioplaces")
+    client_logger = logging.getLogger("aioplaces.client")
+    original_levels = (places_logger.level, library_logger.level, client_logger.level)
+    try:
+        with caplog.at_level(logging.DEBUG):
+            logging.getLogger().setLevel(logging.WARNING)
+            places_logger.setLevel(places_level)
+            library_logger.setLevel(library_level)
+            client_logger.setLevel(client_level)
+
+            assert await async_setup(mock_hass, {}) is True
+            client_logger.debug("Places library debug probe")
+
+            assert library_logger.level == expected_library_level
+            assert client_logger.level == client_level
+            assert ("Places library debug probe" in caplog.text) is debug_visible
+    finally:
+        places_logger.setLevel(original_levels[0])
+        library_logger.setLevel(original_levels[1])
+        client_logger.setLevel(original_levels[2])

@@ -250,10 +250,9 @@ Example automation:
 
 ```yaml
 logger:
-  default: warning
-  logs:
+  default: warning
+  logs:
     custom_components.places: debug
-    aioplaces: debug
 ```
 
 Places uses [aioplaces](https://pypi.org/project/aioplaces/) for Nominatim and
