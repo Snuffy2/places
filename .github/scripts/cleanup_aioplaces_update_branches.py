@@ -57,6 +57,16 @@ class GithubCleanupClient(Protocol):
             ref (str): Git branch reference returned by the mocked GitHub response.
         """
 
+    def get_ref_sha(self, branch: str) -> str | None:
+        """Read a repository branch SHA if the ref exists.
+
+        Args:
+            branch (str): Branch name without the ``heads/`` prefix.
+
+        Returns:
+            Current commit SHA, or ``None`` if the branch does not exist.
+        """
+
 
 class GithubClient:
     """Small GitHub REST client for the workflow cleanup task."""
@@ -116,6 +126,30 @@ class GithubClient:
                 return
             raise
 
+    def get_ref_sha(self, branch: str) -> str | None:
+        """Read a repository branch SHA if the ref exists.
+
+        Args:
+            branch (str): Branch name without the ``heads/`` prefix.
+
+        Returns:
+            Current commit SHA, or ``None`` if the branch does not exist.
+        """
+        url = f"{GITHUB_API_URL}/repos/{self.repository}/git/ref/heads/{branch}"
+        try:
+            payload, _ = self._request("GET", url)
+        except HTTPError as err:
+            if err.code == 404:
+                return None
+            raise
+
+        if not isinstance(payload, dict):
+            raise TypeError(f"Expected a git ref object from {url}")
+        commit = payload.get("object")
+        if not isinstance(commit, dict) or not isinstance(commit.get("sha"), str):
+            raise TypeError(f"Git ref object from {url} is missing a commit SHA")
+        return commit["sha"]
+
     def _request(
         self,
         method: str,
@@ -146,11 +180,9 @@ def cleanup_update_branches(
     client: GithubCleanupClient,
     repository: str,
     branch: str,
-    branch_prefix: str,
     label_name: str,
     keep_pr_number: int | None,
     close_stale_prs: bool,
-    delete_stale_branch: bool,
     delete_merged_branches: bool,
 ) -> CleanupResult:
     """Clean workflow-owned stale pull requests and branches.
@@ -159,44 +191,49 @@ def cleanup_update_branches(
         client (GithubCleanupClient): GitHub client with list, close, and delete methods.
         repository (str): Repository in ``owner/name`` format.
         branch (str): Current workflow update branch.
-        branch_prefix (str): Prefix for workflow-owned update branches.
         label_name (str): Label identifying workflow-created PRs.
         keep_pr_number (int | None): Optional PR number to preserve.
         close_stale_prs (bool): Whether to close open stale update PRs.
-        delete_stale_branch (bool): Whether to delete the current stale branch.
         delete_merged_branches (bool): Whether to delete branches from merged update PRs.
 
     Returns:
         Summary of cleanup actions.
     """
     result = CleanupResult()
-    protected_branches: set[str] = set()
-    branches_to_delete: set[str] = set()
+    protected_branch = False
+    candidate_shas: set[str] = set()
 
     open_pulls = client.list_pulls(state="open")
     for pull in open_pulls:
-        if not _is_workflow_pull(
+        head = pull.get("head", {})
+        head_ref_matches = isinstance(head, dict) and head.get("ref") == branch
+        is_workflow_pull = _is_workflow_pull(
             pull,
             repository=repository,
             branch=branch,
-            branch_prefix=branch_prefix,
             label_name=label_name,
+        )
+        if head_ref_matches and (
+            not is_workflow_pull
+            or (keep_pr_number is not None and _pull_number(pull) == keep_pr_number)
+            or not close_stale_prs
         ):
+            protected_branch = True
+
+        if not is_workflow_pull:
             continue
 
         pull_number = _pull_number(pull)
-        head_ref = _head_ref(pull)
         if keep_pr_number is not None and pull_number == keep_pr_number:
-            protected_branches.add(head_ref)
+            protected_branch = True
             continue
 
         if close_stale_prs:
             client.close_pull(pull_number)
             result.closed_prs.append(pull_number)
-            branches_to_delete.add(head_ref)
-
-    if delete_stale_branch and branch not in protected_branches:
-        branches_to_delete.add(branch)
+            head_sha = _head_sha(pull)
+            if head_sha is not None:
+                candidate_shas.add(head_sha)
 
     if delete_merged_branches:
         closed_pulls = client.list_pulls(state="closed")
@@ -205,15 +242,17 @@ def cleanup_update_branches(
                 pull,
                 repository=repository,
                 branch=branch,
-                branch_prefix=branch_prefix,
                 label_name=label_name,
             ):
-                branches_to_delete.add(_head_ref(pull))
+                head_sha = _head_sha(pull)
+                if head_sha is not None:
+                    candidate_shas.add(head_sha)
 
-    branches_to_delete -= protected_branches
-    for branch_name in sorted(branches_to_delete):
-        client.delete_ref(f"heads/{branch_name}")
-        result.deleted_branches.append(branch_name)
+    if not protected_branch and candidate_shas:
+        current_sha = client.get_ref_sha(branch)
+        if current_sha is not None and current_sha in candidate_shas:
+            client.delete_ref(f"heads/{branch}")
+            result.deleted_branches.append(branch)
 
     return result
 
@@ -223,7 +262,6 @@ def _is_workflow_pull(
     *,
     repository: str,
     branch: str,
-    branch_prefix: str,
     label_name: str,
 ) -> bool:
     """Return whether a pull request belongs to this workflow.
@@ -232,7 +270,6 @@ def _is_workflow_pull(
         pull (Mapping[str, object]): Pull request object.
         repository (str): Repository in ``owner/name`` format.
         branch (str): Current workflow update branch.
-        branch_prefix (str): Prefix for workflow-owned update branches.
         label_name (str): Label identifying workflow-created PRs.
 
     Returns:
@@ -247,31 +284,32 @@ def _is_workflow_pull(
     head = pull.get("head", {})
     if not isinstance(head, dict):
         return False
-    head_ref = head.get("ref")
-    if not isinstance(head_ref, str):
-        return False
-    if head_ref != branch and not head_ref.startswith(branch_prefix):
+    if head.get("ref") != branch:
         return False
 
     head_repo = head.get("repo", {})
     if not isinstance(head_repo, dict):
         return False
+    user = pull.get("user", {})
+    if not isinstance(user, dict) or user.get("login") != "github-actions[bot]":
+        return False
     return head_repo.get("full_name") == repository
 
 
-def _head_ref(pull: Mapping[str, object]) -> str:
-    """Return a pull request head ref.
+def _head_sha(pull: Mapping[str, object]) -> str | None:
+    """Return a pull request head SHA when present.
 
     Args:
         pull (Mapping[str, object]): Pull request object.
 
     Returns:
-        Pull request head ref.
+        Pull request head SHA, or ``None`` if the response lacks one.
     """
-    head = pull["head"]
-    if not isinstance(head, dict) or not isinstance(head.get("ref"), str):
-        raise TypeError("Pull request is missing a head ref")
-    return head["ref"]
+    head = pull.get("head", {})
+    if not isinstance(head, dict):
+        return None
+    sha = head.get("sha")
+    return sha if isinstance(sha, str) else None
 
 
 def _pull_number(pull: Mapping[str, object]) -> int:
@@ -360,11 +398,9 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--branch", required=True)
-    parser.add_argument("--branch-prefix", required=True)
     parser.add_argument("--label-name", required=True)
     parser.add_argument("--keep-pr-number", type=int)
     parser.add_argument("--close-stale-prs", action="store_true")
-    parser.add_argument("--delete-stale-branch", action="store_true")
     parser.add_argument("--delete-merged-branches", action="store_true")
     return parser.parse_args(argv)
 
@@ -390,11 +426,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         client=client,
         repository=args.repository,
         branch=args.branch,
-        branch_prefix=args.branch_prefix,
         label_name=args.label_name,
         keep_pr_number=args.keep_pr_number,
         close_stale_prs=args.close_stale_prs,
-        delete_stale_branch=args.delete_stale_branch,
         delete_merged_branches=args.delete_merged_branches,
     )
     LOGGER.info("Closed stale PRs: %s", result.closed_prs or "none")

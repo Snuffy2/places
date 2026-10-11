@@ -24,20 +24,27 @@ class FakeCleanupClient:
         *,
         open_pulls: list[dict[str, object]],
         closed_pulls: list[dict[str, object]],
+        ref_shas: dict[str, str] | None = None,
         fail_on_close: bool = False,
+        fail_on_ref_lookup: bool = False,
     ) -> None:
         """Initialize fake pull request state.
 
         Args:
             open_pulls (list[dict[str, object]]): Pull requests to return for open PR lookups.
             closed_pulls (list[dict[str, object]]): Pull requests to return for closed PR lookups.
+            ref_shas (dict[str, str] | None): Current branch SHAs returned by the fake.
             fail_on_close (bool): Whether closing a PR should fail the test.
+            fail_on_ref_lookup (bool): Whether looking up a branch SHA should fail.
         """
         self.open_pulls = open_pulls
         self.closed_pulls = closed_pulls
+        self.ref_shas = ref_shas or {}
         self.fail_on_close = fail_on_close
+        self.fail_on_ref_lookup = fail_on_ref_lookup
         self.closed_prs: list[int] = []
         self.deleted_refs: list[str] = []
+        self.ref_lookups: list[str] = []
 
     def list_pulls(self, *, state: str) -> list[dict[str, object]]:
         """Return fake pull requests by state.
@@ -71,6 +78,23 @@ class FakeCleanupClient:
         """
         self.deleted_refs.append(ref)
 
+    def get_ref_sha(self, branch: str) -> str | None:
+        """Return the fake current branch SHA.
+
+        Args:
+            branch (str): Branch name requested by the cleanup routine.
+
+        Returns:
+            str | None: Current branch SHA, or ``None`` if the fake branch is missing.
+
+        Raises:
+            OSError: The fake was configured to fail ref lookups.
+        """
+        self.ref_lookups.append(branch)
+        if self.fail_on_ref_lookup:
+            raise OSError("GitHub ref lookup failed")
+        return self.ref_shas.get(branch)
+
 
 def _workflow_pull(
     *,
@@ -78,6 +102,9 @@ def _workflow_pull(
     ref: str = "chore/update-aioplaces-manifest",
     label: str = "dependencies",
     merged_at: str | None = None,
+    sha: str = "commit-sha",
+    author: str = "github-actions[bot]",
+    repository: str = "o/r",
 ) -> dict[str, object]:
     """Return a fake workflow pull request object.
 
@@ -86,6 +113,9 @@ def _workflow_pull(
         ref (str): Pull request head ref.
         label (str): Pull request label name.
         merged_at (str | None): Optional merge timestamp for closed PRs.
+        sha (str): Commit SHA at the pull request head.
+        author (str): Login of the pull request author.
+        repository (str): Repository containing the pull request head branch.
 
     Returns:
         dict[str, object]: Fake pull request object shaped like the GitHub REST API response.
@@ -93,8 +123,9 @@ def _workflow_pull(
     return {
         "number": number,
         "merged_at": merged_at,
-        "head": {"ref": ref, "repo": {"full_name": "o/r"}},
+        "head": {"ref": ref, "sha": sha, "repo": {"full_name": repository}},
         "labels": [{"name": label}],
+        "user": {"login": author},
     }
 
 
@@ -464,81 +495,259 @@ def test_release_note_script_handles_url_errors(
     assert result == 1
 
 
-def test_cleanup_script_closes_stale_prs_and_deletes_workflow_branches(
+def test_cleanup_script_preserves_human_same_prefix_and_same_name_prs(
     cleanup_script: ModuleType,
 ) -> None:
-    """Cleanup script should close stale PRs and remove workflow-created branches.
+    """Cleanup should preserve human PRs, even when names match or share a prefix.
 
     Args:
         cleanup_script (ModuleType): Loaded branch-cleanup workflow helper module.
     """
+    branch = "chore/update-aioplaces-manifest"
     client = FakeCleanupClient(
         open_pulls=[
-            _workflow_pull(number=10),
-            _workflow_pull(number=9, ref="chore/update-aioplaces-old"),
-            _workflow_pull(number=11, ref="feature/manual"),
+            _workflow_pull(number=10, sha="human-sha", author="alice"),
+            _workflow_pull(
+                number=11,
+                ref="chore/update-aioplaces-parser",
+                sha="parser-sha",
+                author="bob",
+            ),
+            _workflow_pull(number=12, label="bugfix"),
+            _workflow_pull(number=13, repository="fork-owner/places"),
         ],
         closed_pulls=[
-            _workflow_pull(number=8, merged_at="2026-05-28T00:00:00Z"),
-            _workflow_pull(number=7, ref="chore/update-aioplaces-old"),
+            _workflow_pull(number=8, merged_at="2026-05-28T00:00:00Z", sha="old-sha"),
         ],
+        ref_shas={branch: "old-sha"},
     )
 
     result = cleanup_script.cleanup_update_branches(
         client=client,
         repository="o/r",
-        branch="chore/update-aioplaces-manifest",
-        branch_prefix="chore/update-aioplaces",
+        branch=branch,
         label_name="dependencies",
         keep_pr_number=None,
         close_stale_prs=True,
-        delete_stale_branch=True,
         delete_merged_branches=True,
     )
 
-    assert sorted(client.closed_prs) == [9, 10]
-    assert sorted(client.deleted_refs) == [
-        "heads/chore/update-aioplaces-manifest",
-        "heads/chore/update-aioplaces-old",
-    ]
-    assert sorted(result.closed_prs) == [9, 10]
-    assert sorted(result.deleted_branches) == [
-        "chore/update-aioplaces-manifest",
-        "chore/update-aioplaces-old",
-    ]
+    assert client.closed_prs == []
+    assert client.deleted_refs == []
+    assert result.closed_prs == []
+    assert result.deleted_branches == []
 
 
-def test_cleanup_script_keeps_active_update_branch(cleanup_script: ModuleType) -> None:
-    """Cleanup script should not delete the branch for the kept update PR.
+def test_cleanup_script_does_not_delete_unowned_or_orphan_branch(
+    cleanup_script: ModuleType,
+) -> None:
+    """Unowned PRs and branches without a matching workflow PR stay untouched.
 
     Args:
         cleanup_script (ModuleType): Loaded branch-cleanup workflow helper module.
     """
+    branch = "chore/update-aioplaces-manifest"
     client = FakeCleanupClient(
-        open_pulls=[_workflow_pull(number=12)],
+        open_pulls=[_workflow_pull(number=10, author="alice")],
+        closed_pulls=[],
+        ref_shas={branch: "human-sha"},
+    )
+
+    result = cleanup_script.cleanup_update_branches(
+        client=client,
+        repository="o/r",
+        branch=branch,
+        label_name="dependencies",
+        keep_pr_number=None,
+        close_stale_prs=True,
+        delete_merged_branches=True,
+    )
+
+    assert client.closed_prs == []
+    assert client.deleted_refs == []
+    assert client.ref_lookups == []
+    assert result.closed_prs == []
+    assert result.deleted_branches == []
+
+    orphan = FakeCleanupClient(open_pulls=[], closed_pulls=[], ref_shas={branch: "orphan-sha"})
+    orphan_result = cleanup_script.cleanup_update_branches(
+        client=orphan,
+        repository="o/r",
+        branch=branch,
+        label_name="dependencies",
+        keep_pr_number=None,
+        close_stale_prs=True,
+        delete_merged_branches=True,
+    )
+
+    assert orphan.deleted_refs == []
+    assert orphan.ref_lookups == []
+    assert orphan_result.deleted_branches == []
+
+
+def test_cleanup_script_does_not_delete_recreated_branch_with_new_sha(
+    cleanup_script: ModuleType,
+) -> None:
+    """A merged bot PR cannot delete a branch recreated at a different commit.
+
+    Args:
+        cleanup_script (ModuleType): Loaded branch-cleanup workflow helper module.
+    """
+    branch = "chore/update-aioplaces-manifest"
+    client = FakeCleanupClient(
+        open_pulls=[],
         closed_pulls=[
-            _workflow_pull(number=8, merged_at="2026-05-28T00:00:00Z"),
-            _workflow_pull(
-                number=6,
-                ref="chore/update-aioplaces-old",
-                merged_at="2026-05-20T00:00:00Z",
-            ),
+            _workflow_pull(number=8, merged_at="2026-05-28T00:00:00Z", sha="old-sha"),
         ],
+        ref_shas={branch: "recreated-sha"},
+    )
+
+    result = cleanup_script.cleanup_update_branches(
+        client=client,
+        repository="o/r",
+        branch=branch,
+        label_name="dependencies",
+        keep_pr_number=None,
+        close_stale_prs=True,
+        delete_merged_branches=True,
+    )
+
+    assert client.ref_lookups == [branch]
+    assert client.deleted_refs == []
+    assert result.deleted_branches == []
+
+
+def test_cleanup_script_does_not_delete_when_ref_lookup_fails(
+    cleanup_script: ModuleType,
+) -> None:
+    """A failed current-ref lookup cannot authorize deleting a branch.
+
+    Args:
+        cleanup_script (ModuleType): Loaded branch-cleanup workflow helper module.
+    """
+    branch = "chore/update-aioplaces-manifest"
+    client = FakeCleanupClient(
+        open_pulls=[],
+        closed_pulls=[
+            _workflow_pull(number=8, merged_at="2026-05-28T00:00:00Z", sha="old-sha"),
+        ],
+        fail_on_ref_lookup=True,
+    )
+
+    with pytest.raises(OSError, match="GitHub ref lookup failed"):
+        cleanup_script.cleanup_update_branches(
+            client=client,
+            repository="o/r",
+            branch=branch,
+            label_name="dependencies",
+            keep_pr_number=None,
+            close_stale_prs=True,
+            delete_merged_branches=True,
+        )
+
+    assert client.ref_lookups == [branch]
+    assert client.deleted_refs == []
+
+
+def test_cleanup_script_closes_and_deletes_valid_stale_bot_pr(
+    cleanup_script: ModuleType,
+) -> None:
+    """A stale workflow bot PR closes and deletes only its unchanged branch.
+
+    Args:
+        cleanup_script (ModuleType): Loaded branch-cleanup workflow helper module.
+    """
+    branch = "chore/update-aioplaces-manifest"
+    client = FakeCleanupClient(
+        open_pulls=[_workflow_pull(number=10, sha="workflow-sha")],
+        closed_pulls=[],
+        ref_shas={branch: "workflow-sha"},
+    )
+
+    result = cleanup_script.cleanup_update_branches(
+        client=client,
+        repository="o/r",
+        branch=branch,
+        label_name="dependencies",
+        keep_pr_number=None,
+        close_stale_prs=True,
+        delete_merged_branches=False,
+    )
+
+    assert client.closed_prs == [10]
+    assert client.ref_lookups == [branch]
+    assert client.deleted_refs == [f"heads/{branch}"]
+    assert result.closed_prs == [10]
+    assert result.deleted_branches == [branch]
+
+
+def test_cleanup_script_keeps_active_update_branch_despite_merged_history(
+    cleanup_script: ModuleType,
+) -> None:
+    """The active update PR protects its branch from historical merged PRs.
+
+    Args:
+        cleanup_script (ModuleType): Loaded branch-cleanup workflow helper module.
+    """
+    branch = "chore/update-aioplaces-manifest"
+    client = FakeCleanupClient(
+        open_pulls=[_workflow_pull(number=12, sha="active-sha")],
+        closed_pulls=[
+            _workflow_pull(number=8, merged_at="2026-05-28T00:00:00Z", sha="old-sha"),
+        ],
+        ref_shas={branch: "active-sha"},
         fail_on_close=True,
     )
 
     result = cleanup_script.cleanup_update_branches(
         client=client,
         repository="o/r",
-        branch="chore/update-aioplaces-manifest",
-        branch_prefix="chore/update-aioplaces",
+        branch=branch,
         label_name="dependencies",
         keep_pr_number=12,
         close_stale_prs=True,
-        delete_stale_branch=False,
         delete_merged_branches=True,
     )
 
-    assert client.deleted_refs == ["heads/chore/update-aioplaces-old"]
+    assert client.closed_prs == []
+    assert client.deleted_refs == []
     assert result.closed_prs == []
-    assert result.deleted_branches == ["chore/update-aioplaces-old"]
+    assert result.deleted_branches == []
+
+
+def test_cleanup_github_client_returns_none_for_missing_ref(
+    cleanup_script: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub's missing-ref response is represented as no branch SHA.
+
+    Args:
+        cleanup_script (ModuleType): Loaded branch-cleanup workflow helper module.
+        monkeypatch (pytest.MonkeyPatch): Fixture used to replace the HTTP request.
+    """
+
+    def raise_not_found(request: object, *, timeout: int) -> Never:
+        """Raise an HTTP 404 response for a missing branch ref.
+
+        Args:
+            request (object): HTTP request passed by the GitHub client.
+            timeout (int): Request timeout passed by the GitHub client.
+
+        Returns:
+            Never: Never returns normally because the 404 is always raised.
+
+        Raises:
+            cleanup_script.HTTPError: Always raised to simulate a missing ref.
+        """
+        raise cleanup_script.HTTPError(
+            "https://api.github.com/repos/o/r/git/ref/heads/example",
+            404,
+            "Not Found",
+            None,
+            None,
+        )
+
+    monkeypatch.setattr(cleanup_script, "urlopen", raise_not_found)
+    client = cleanup_script.GithubClient(repository="o/r", token="")
+
+    assert client.get_ref_sha("example") is None

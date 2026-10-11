@@ -128,7 +128,6 @@ jobs:
           python .github/scripts/cleanup_aioplaces_update_branches.py \
             --repository "$REPOSITORY" \
             --branch chore/update-aioplaces-manifest \
-            --branch-prefix chore/update-aioplaces \
             --label-name dependencies \
             --keep-pr-number "$KEEP_PR_NUMBER" \
             --close-stale-prs \
@@ -149,8 +148,6 @@ jobs:
           python .github/scripts/cleanup_aioplaces_update_branches.py \
             --repository "$REPOSITORY" \
             --branch chore/update-aioplaces-manifest \
-            --branch-prefix chore/update-aioplaces \
             --label-name dependencies \
             --close-stale-prs \
-            --delete-stale-branch \
             --delete-merged-branches
