@@ -225,7 +225,6 @@ def cleanup_update_branches(
 
         pull_number = _pull_number(pull)
         if keep_pr_number is not None and pull_number == keep_pr_number:
-            protected_branch = True
             continue
 
         if close_stale_prs:
