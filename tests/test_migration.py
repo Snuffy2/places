@@ -123,17 +123,20 @@ def _hass_for_legacy_path(tmp_path: Path) -> MagicMock:
     return hass
 
 
-def _write_legacy_snapshot(path: Path, contents: str) -> None:
+def _write_legacy_snapshot(path: Path, contents: str | bytes) -> None:
     """Write a legacy snapshot and create its containing folder.
 
     Args:
         path (Path):
             Storage path used for the persistence operation.
-        contents (str):
+        contents (str | bytes):
             Serialized legacy snapshot written to disk.
     """
     path.parent.mkdir(parents=True)
-    path.write_text(contents)
+    if isinstance(contents, bytes):
+        path.write_bytes(contents)
+    else:
+        path.write_text(contents)
 
 
 def test_missing_legacy_snapshot_returns_none(tmp_path: Path) -> None:
@@ -295,18 +298,25 @@ async def test_legacy_entity_keys_are_renamed_before_store_save(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("contents", ["{", json.dumps(["not", "an", "object"])])
+@pytest.mark.parametrize(
+    "contents",
+    [
+        pytest.param("{", id="malformed-json"),
+        pytest.param(json.dumps(["not", "an", "object"]), id="non-object-root"),
+        pytest.param(b"\xff", id="invalid-utf8"),
+    ],
+)
 async def test_unusable_snapshot_is_removed_without_save(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, contents: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, contents: str | bytes
 ) -> None:
-    """Malformed and non-object snapshots are discarded without a Store write.
+    """Malformed, non-object, and invalid UTF-8 snapshots are discarded.
 
     Args:
         tmp_path (Path):
             Temporary directory used for isolated storage files.
         monkeypatch (pytest.MonkeyPatch):
             Pytest fixture for replacing dependencies.
-        contents (str):
+        contents (str | bytes):
             Serialized legacy snapshot written to disk.
     """
     monkeypatch.setattr("custom_components.places.migration.Store", _FakeStore)
@@ -315,31 +325,6 @@ async def test_unusable_snapshot_is_removed_without_save(
     _write_legacy_snapshot(path, contents)
 
     await async_migrate_legacy_snapshot(hass, "entry-2", "Test Place")
-
-    assert _FakeStore.saved == []
-    assert not path.exists()
-    assert not path.parent.exists()
-
-
-@pytest.mark.asyncio
-async def test_invalid_utf8_snapshot_is_removed_without_save(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A snapshot containing invalid UTF-8 is discarded without a Store write.
-
-    Args:
-        tmp_path (Path):
-            Temporary directory used for isolated storage files.
-        monkeypatch (pytest.MonkeyPatch):
-            Pytest fixture for replacing dependencies.
-    """
-    monkeypatch.setattr("custom_components.places.migration.Store", _FakeStore)
-    hass = _hass_for_legacy_path(tmp_path)
-    path = legacy_json_path(hass, "entry-invalid-utf8")
-    path.parent.mkdir(parents=True)
-    path.write_bytes(b"\xff")
-
-    await async_migrate_legacy_snapshot(hass, "entry-invalid-utf8", "Test Place")
 
     assert _FakeStore.saved == []
     assert not path.exists()

@@ -1186,7 +1186,38 @@ async def test_async_unload_entry_result(
     """
     coordinator = _FakeCoordinator(mock_hass, mock_entry, {}, MagicMock())
     mock_entry.runtime_data = coordinator
-    mock_hass.config_entries.async_unload_platforms.return_value = unload_return
+    call_order: list[str] = []
+    if not unload_return:
+
+        async def mark_prepare_unload() -> None:
+            """Record coordinator preparation before the failed unload."""
+            call_order.append("prepare_unload")
+
+        async def mark_unload(_entry: MockConfigEntry, _platforms: list[str]) -> bool:
+            """Record platform unload and return its configured failure.
+
+            Args:
+                _entry (MockConfigEntry):
+                    Config entry passed to platform unloading.
+                _platforms (list[str]):
+                    Platforms requested for unloading.
+
+            Returns:
+                bool:
+                    ``False`` to model the failed platform unload.
+            """
+            call_order.append("unload_platforms")
+            return False
+
+        async def mark_resume() -> None:
+            """Record coordinator recovery after platform unload fails."""
+            call_order.append("resume")
+
+        coordinator.async_prepare_unload.side_effect = mark_prepare_unload
+        coordinator.async_resume_after_failed_unload.side_effect = mark_resume
+        mock_hass.config_entries.async_unload_platforms.side_effect = mark_unload
+    else:
+        mock_hass.config_entries.async_unload_platforms.return_value = unload_return
 
     result = await async_unload_entry(mock_hass, mock_entry)
 
@@ -1198,6 +1229,7 @@ async def test_async_unload_entry_result(
         coordinator.async_resume_after_failed_unload.assert_not_awaited()
         assert mock_entry.runtime_data is None
     else:
+        assert call_order == ["prepare_unload", "unload_platforms", "resume"]
         coordinator.async_shutdown.assert_not_awaited()
         coordinator.async_resume_after_failed_unload.assert_awaited_once_with()
         assert mock_entry.runtime_data is coordinator
@@ -1278,43 +1310,6 @@ async def test_async_unload_entry_completes_when_shutdown_raises(
     assert entry.runtime_data is None
     assert "shutdown failed" in caplog.text
     assert entry.entry_id in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_async_unload_entry_resumes_coordinator_when_platform_unload_fails(
-    mock_hass: MagicMock, mock_entry: MockConfigEntry
-) -> None:
-    """A failed platform unload should leave the still-loaded coordinator active.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-    """
-    coordinator = _FakeCoordinator(mock_hass, mock_entry, {}, MagicMock())
-    mock_entry.runtime_data = coordinator
-    call_order: list[str] = []
-
-    async def mark_prepare_unload() -> None:
-        call_order.append("prepare_unload")
-
-    async def mark_unload(_entry: MockConfigEntry, _platforms: list[str]) -> bool:
-        call_order.append("unload_platforms")
-        return False
-
-    async def mark_resume() -> None:
-        call_order.append("resume")
-
-    coordinator.async_prepare_unload.side_effect = mark_prepare_unload
-    coordinator.async_resume_after_failed_unload.side_effect = mark_resume
-    mock_hass.config_entries.async_unload_platforms.side_effect = mark_unload
-
-    result = await async_unload_entry(mock_hass, mock_entry)
-
-    assert result is False
-    assert call_order == ["prepare_unload", "unload_platforms", "resume"]
-    coordinator.async_shutdown.assert_not_awaited()
 
 
 @pytest.mark.asyncio
