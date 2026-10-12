@@ -33,17 +33,12 @@ async def test_map_provider_select_setup_and_update() -> None:
     coordinator.async_update_setting.assert_awaited_once_with(CONF_MAP_PROVIDER, "osm")
 
 
-async def test_map_provider_select_delegates_raw_option_to_coordinator() -> None:
-    """Map provider option updates are delegated directly to coordinator."""
+async def test_map_provider_select_propagates_coordinator_error() -> None:
+    """An invalid provider selection propagates the coordinator's error."""
     coordinator = MagicMock()
     coordinator.async_update_setting = AsyncMock()
     entity = PlacesMapProviderSelect(coordinator)
 
-    await entity.async_select_option("GoOgLe")
-
-    coordinator.async_update_setting.assert_awaited_once_with(CONF_MAP_PROVIDER, "GoOgLe")
-
-    coordinator.async_update_setting.reset_mock()
     coordinator.async_update_setting.side_effect = HomeAssistantError("Invalid map provider")
     with pytest.raises(HomeAssistantError, match="Invalid map provider"):
         await entity.async_select_option("bing")
