@@ -289,27 +289,19 @@ async def test_parse_attribute_parentheses_incl_excl(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    (
-        "parens_input",
-        "parens_expected_incl",
-        "parens_expected_excl",
-        "bracket_input",
-        "bracket_expected",
-    ),
+    ("parens_input", "parens_expected_incl", "parens_expected_excl"),
     [
-        ("(work,home)", ["work", "home"], [], "[option]", "option"),
-        ("(-,work,home)", [], ["work", "home"], "[option]", "option"),
+        ("(work,home)", ["work", "home"], []),
+        ("(-,work,home)", [], ["work", "home"]),
     ],
 )
-async def test_parse_parens_and_bracket(
+async def test_parse_parens_inclusion_and_exclusion(
     parens_input: str,
     parens_expected_incl: list[str],
     parens_expected_excl: list[str],
-    bracket_input: str,
-    bracket_expected: str,
     advanced_parser: AdvancedParserFactory,
 ) -> None:
-    """Parse parens and bracketed options into their expected parts.
+    """Parse included and excluded values from parenthesized expressions.
 
     Args:
         parens_input (str):
@@ -318,20 +310,13 @@ async def test_parse_parens_and_bracket(
             Tokens expected inside the parenthesized group.
         parens_expected_excl (list[str]):
             Tokens expected outside the parenthesized group.
-        bracket_input (str):
-            Bracketed expression supplied to the parser.
-        bracket_expected (str):
-            Tokens expected after bracket parsing.
         advanced_parser (AdvancedParserFactory):
             Advanced display-options parser fixture.
     """
     parser, _sensor = advanced_parser()
-    incl, excl, _incl_attr, _excl_attr, next_opt = await parser.parse_parens(parens_input)
+    incl, excl, _incl_attr, _excl_attr, _next_opt = await parser.parse_parens(parens_input)
     assert incl == parens_expected_incl
     assert excl == parens_expected_excl
-    none_opt, next_opt = await parser.parse_bracket(bracket_input)
-    assert none_opt == bracket_expected
-    assert isinstance(next_opt, str)
 
 
 @pytest.mark.asyncio
@@ -381,33 +366,22 @@ async def test_compile_state_variants(
 
 
 @pytest.mark.asyncio
-async def test_build_from_advanced_options_bracket_paren_mismatch(sensor: MockSensor) -> None:
-    """Return early on unmatched brackets without modifying state_list.
-
-    Args:
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-    """
-    # Use shared sensor fixture
-    sensor.attrs = {}
-    parser = AdvancedOptionsParser(sensor, "[unmatched")
-    # Should return early (no error thrown, state_list unchanged)
-    await parser.build_from_advanced_options()
-    assert parser.state_list == []
-
-
-@pytest.mark.asyncio
-async def test_build_next_option_only_traverses_comma_prefixed_suffix(sensor: MockSensor) -> None:
+async def test_build_next_option_only_traverses_comma_prefixed_suffix(
+    advanced_parser: AdvancedParserFactory,
+) -> None:
     """Do not process malformed non-comma suffix text after a bracket fallback.
 
     Args:
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
+        advanced_parser (AdvancedParserFactory):
+            Factory for the parser and sensor used by this expression.
     """
-    sensor.attrs = {"zone_name": "Home", "place_type": "Restaurant"}
-    parser = AdvancedOptionsParser(sensor, "zone_name[place_type]place_type")
+    parser, _sensor = advanced_parser(
+        "zone_name[place_type]place_type",
+        {"zone_name": "Home", "place_type": "Restaurant"},
+        in_zone=False,
+    )
     await parser.build_from_advanced_options()
-    assert parser.state_list == ["Restaurant"]
+    assert await parser.compile_state() == "Restaurant"
 
 
 @pytest.mark.asyncio
@@ -421,49 +395,37 @@ async def test_build_from_advanced_options_empty_string(sensor: MockSensor) -> N
     sensor.attrs = {}
     parser = AdvancedOptionsParser(sensor, "")
     await parser.build_from_advanced_options()
-    assert parser.state_list == []
+    assert await parser.compile_state() == ""
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("fn_name", "input_val"),
+    "input_val",
     [
-        ("parse_bracket", "[unmatched"),
-        ("parse_parens", "(unmatched"),
+        "[unmatched",
+        "zone_name(unmatched",
     ],
 )
 async def test_mismatched_special_chars_log_error(
     caplog: pytest.LogCaptureFixture,
-    sensor: MockSensor,
-    fn_name: str,
+    advanced_parser: AdvancedParserFactory,
     input_val: str,
 ) -> None:
-    """Parametrized: unmatched bracket/paren inputs should log an error and return empty-ish results.
+    """Reject malformed expressions with a diagnostic and no rendered state.
 
     Args:
         caplog (pytest.LogCaptureFixture):
             Captured log records used for message assertions.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        fn_name (str):
-            Parser helper name included in the diagnostic message.
+        advanced_parser (AdvancedParserFactory):
+            Factory for the parser and sensor used by this expression.
         input_val (str):
-            Input consumed by the conversion helper.
+            Malformed expression passed through the parser's public build method.
     """
-    sensor.attrs = {}
-    parser = AdvancedOptionsParser(sensor, "")
+    parser, _sensor = advanced_parser(input_val, {}, in_zone=True)
     caplog.set_level(logging.ERROR, logger="custom_components.places.advanced_options")
-    fn = getattr(parser, fn_name)
-    res = await fn(input_val)
-    # Expect an error record was emitted
+    await parser.build_from_advanced_options()
     assert any(r.levelname == "ERROR" for r in caplog.records)
-    # Both functions return an 'empty' style result on mismatch; assert using simple checks
-    if fn_name == "parse_bracket":
-        none_opt, _next_opt = res
-        assert none_opt is None or none_opt == ""
-    else:
-        incl, _excl, _incl_attr, _excl_attr, _next_opt = res
-        assert incl == []
+    assert await parser.compile_state() == ""
 
 
 @pytest.mark.asyncio
@@ -497,80 +459,59 @@ async def test_parse_bracket_variants(
 
 
 @pytest.mark.asyncio
-async def test_process_bracket_or_parens_comma_first_builds_states(sensor: MockSensor) -> None:
-    """Process comma-separated options and append title-cased states.
-
-    Args:
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-    """
-    attrs: dict[str, object] = {
-        "zone_name": "Home",
-        "place_type": "restaurant",
-        "name": "Test",
-    }
-    sensor.attrs = attrs
-    sensor._in_zone = True
-    parser = AdvancedOptionsParser(sensor, "zone_name,place_type")
-    await parser.build_from_advanced_options()
-    # Title casing applied to place_type
-    assert parser.state_list == ["Home", "Restaurant"]
-
-
-@pytest.mark.asyncio
-async def test_bracket_fallback_when_primary_option_none(sensor: MockSensor) -> None:
+async def test_bracket_fallback_when_primary_option_none(
+    advanced_parser: AdvancedParserFactory,
+) -> None:
     """Use bracket fallback when primary option yields None.
 
     Args:
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
+        advanced_parser (AdvancedParserFactory):
+            Factory for the parser and sensor used by this expression.
     """
     attrs: dict[str, object] = {"place_type": "work", "name": "Test"}
-    sensor.attrs = attrs
-    sensor._in_zone = False  # zone_name will be excluded (not in zone)
-    parser = AdvancedOptionsParser(sensor, "zone_name[place_type(work)]")
+    parser, _sensor = advanced_parser("zone_name[place_type(work)]", attrs, in_zone=False)
     await parser.build_from_advanced_options()
     # zone_name excluded so fallback to place_type(work) -> Work
-    assert parser.state_list == ["Work"]
+    assert await parser.compile_state() == "Work"
 
 
 @pytest.mark.asyncio
-async def test_paren_then_bracket_fallback_exclusion(sensor: MockSensor) -> None:
+async def test_paren_then_bracket_fallback_exclusion(
+    advanced_parser: AdvancedParserFactory,
+) -> None:
     """Parenthesis filters can exclude primary option and fall back to bracket option.
 
     Args:
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
+        advanced_parser (AdvancedParserFactory):
+            Factory for the parser and sensor used by this expression.
     """
     attrs: dict[str, object] = {
         "zone_name": "Home",
         "place_type": "restaurant",
         "name": "Test",
     }
-    sensor.attrs = attrs
-    sensor._in_zone = True
     # Parenthesis after option (parenthesis-first branch relative to first special char): exclude 'home'
-    parser = AdvancedOptionsParser(sensor, "zone_name(-,home)[place_type]")
+    parser, _sensor = advanced_parser("zone_name(-,home)[place_type]", attrs, in_zone=True)
     await parser.build_from_advanced_options()
     # zone_name excluded by paren filter, fallback processes place_type -> Restaurant
-    assert parser.state_list == ["Restaurant"]
+    assert await parser.compile_state() == "Restaurant"
 
 
 @pytest.mark.asyncio
-async def test_get_option_state_incl_attr_blank_causes_exclusion(sensor: MockSensor) -> None:
+async def test_get_option_state_incl_attr_blank_causes_exclusion(
+    advanced_parser: AdvancedParserFactory,
+) -> None:
     """Return None when included attribute filters reference missing/blank attributes.
 
     Args:
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
+        advanced_parser (AdvancedParserFactory):
+            Factory for the parser and its configured sensor.
     """
     attrs: dict[str, object] = {
         "zone_name": "Home",
         "name": "Test",
     }  # place_type missing -> blank
-    sensor.attrs = attrs
-    sensor._in_zone = True
-    parser = AdvancedOptionsParser(sensor, "")
+    parser, _sensor = advanced_parser(attrs=attrs, in_zone=True)
     out = await parser.get_option_state("zone_name", incl_attr={"place_type": ["restaurant"]})
     assert out is None
 

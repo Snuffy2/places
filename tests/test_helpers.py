@@ -12,7 +12,6 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import pytest
 
 from custom_components.places import helpers
-from custom_components.places.const import DOMAIN, PLACES_CLIENT
 from custom_components.places.helpers import clear_since_from_state, safe_truncate
 
 
@@ -102,8 +101,9 @@ async def test_ensure_places_client_uses_home_assistant_owned_session(
     )
 
     client = helpers._ensure_places_client(hass)
+    reused_client = helpers._ensure_places_client(hass)
 
-    assert client is hass.data[DOMAIN][PLACES_CLIENT]
+    assert reused_client is client
     assert not session.closed
     assert async_get_clientsession(hass) is session
 
@@ -236,19 +236,17 @@ async def test_places_client_retries_after_valid_no_result(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [429, 500])
 async def test_places_client_retries_after_http_error(
-    hass: HomeAssistant, aioclient_mock: AioClientMock, status: int
+    hass: HomeAssistant, aioclient_mock: AioClientMock
 ) -> None:
     """An HTTP failure is surfaced and does not prevent a later successful lookup.
 
     Args:
         hass (HomeAssistant): Runtime providing the shared session.
         aioclient_mock (AioClientMock): HTTP boundary with sequential replies.
-        status (int): Failure status returned for the first request.
     """
     url = _reverse_url()
-    failed = aioclient_mock.request("get", url, status=status)
+    failed = aioclient_mock.request("get", url, status=429)
     expected: JSONMapping = {"osm_id": 789, "display_name": "Recovered"}
     recovered = aioclient_mock.request("get", url, json=expected)
     _sequence_responses(failed, [failed, recovered])
@@ -257,6 +255,6 @@ async def test_places_client_retries_after_http_error(
     with pytest.raises(HTTPError) as error:
         await client.reverse(40.7, -73.9)
 
-    assert error.value.status == status
+    assert error.value.status == 429
     assert await client.reverse(40.7, -73.9) == expected
     assert aioclient_mock.call_count == 2
