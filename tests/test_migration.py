@@ -253,23 +253,11 @@ async def test_valid_snapshot_is_saved_then_removed(
 
 
 @pytest.mark.asyncio
-async def test_legacy_entity_keys_are_renamed_before_store_save(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Legacy JSON entity keys are replaced by the new unpublished names.
-
-    Args:
-        tmp_path (Path):
-            Temporary directory used for isolated storage files.
-        monkeypatch (pytest.MonkeyPatch):
-            Pytest fixture for replacing dependencies.
-    """
-    monkeypatch.setattr("custom_components.places.migration.Store", _FakeStore)
-    hass = _hass_for_legacy_path(tmp_path)
-    path = legacy_json_path(hass, "entry-entity-keys")
-    _write_legacy_snapshot(
-        path,
-        json.dumps(
+@pytest.mark.parametrize(
+    ("entry_id", "legacy_attributes", "expected_attributes"),
+    [
+        pytest.param(
+            "entry-entity-keys",
             {
                 "devicetracker_zone": "home",
                 "devicetracker_zone_name": "Home",
@@ -278,23 +266,65 @@ async def test_legacy_entity_keys_are_renamed_before_store_save(
                 "current_latitude": 37.5,
                 "current_longitude": -77.4,
                 "street_ref": "US-1",
-            }
+            },
+            {
+                ATTR_DEVICETRACKER_ZONE: "home",
+                ATTR_DEVICETRACKER_ZONE_NAME: "Home",
+                ATTR_PLACE_NEIGHBOURHOOD: "Downtown",
+                ATTR_REGION: "Virginia",
+                ATTR_LATITUDE: 37.5,
+                ATTR_LONGITUDE: -77.4,
+                ATTR_ROUTE_NUMBER: "US-1",
+            },
+            id="entity-keys",
         ),
-    )
+        pytest.param(
+            "entry-distance",
+            {
+                ATTR_CITY: "Legacy City",
+                "distance_from_home_m": 12.5,
+                "distance_traveled_m": 3.25,
+            },
+            {
+                ATTR_CITY: "Legacy City",
+                ATTR_DISTANCE_FROM_HOME: 12.5,
+                ATTR_DISTANCE_TRAVELED: 3.25,
+            },
+            id="distance-keys",
+        ),
+    ],
+)
+async def test_legacy_keys_are_normalized_before_store_save(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_id: str,
+    legacy_attributes: dict[str, object],
+    expected_attributes: dict[str, object],
+) -> None:
+    """Legacy keys from the source snapshot are normalized before Store save.
 
-    await async_migrate_legacy_snapshot(hass, "entry-entity-keys", "Test Place")
+    Args:
+        tmp_path (Path):
+            Temporary directory used for isolated storage files.
+        monkeypatch (pytest.MonkeyPatch):
+            Pytest fixture for replacing dependencies.
+        entry_id (str):
+            Entry ID used for the source snapshot and Store key.
+        legacy_attributes (dict[str, object]):
+            Legacy snapshot keys written to the migration source.
+        expected_attributes (dict[str, object]):
+            Current persisted keys expected at the Store boundary.
+    """
+    monkeypatch.setattr("custom_components.places.migration.Store", _FakeStore)
+    hass = _hass_for_legacy_path(tmp_path)
+    path = legacy_json_path(hass, entry_id)
+    _write_legacy_snapshot(path, json.dumps(legacy_attributes))
 
-    assert _FakeStore.saved == [
-        {
-            ATTR_DEVICETRACKER_ZONE: "home",
-            ATTR_DEVICETRACKER_ZONE_NAME: "Home",
-            ATTR_PLACE_NEIGHBOURHOOD: "Downtown",
-            ATTR_REGION: "Virginia",
-            ATTR_LATITUDE: 37.5,
-            ATTR_LONGITUDE: -77.4,
-            ATTR_ROUTE_NUMBER: "US-1",
-        }
-    ]
+    await async_migrate_legacy_snapshot(hass, entry_id, "Test Place")
+
+    assert _FakeStore.saved == [expected_attributes]
+    assert not path.exists()
+    assert not path.parent.exists()
 
 
 @pytest.mark.asyncio
@@ -469,45 +499,6 @@ async def test_invalid_store_data_is_replaced_by_legacy_snapshot(
     await async_migrate_legacy_snapshot(hass, "entry-invalid-store", "Test Place")
 
     assert _FakeStore.saved == [{ATTR_CITY: "Legacy City"}]
-    assert not path.exists()
-    assert not path.parent.exists()
-
-
-@pytest.mark.asyncio
-async def test_legacy_distance_keys_are_normalized_before_store_save(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Legacy meter distance keys are copied to the current persisted names.
-
-    Args:
-        tmp_path (Path):
-            Temporary directory used for isolated storage files.
-        monkeypatch (pytest.MonkeyPatch):
-            Pytest fixture for replacing dependencies.
-    """
-    monkeypatch.setattr("custom_components.places.migration.Store", _FakeStore)
-    hass = _hass_for_legacy_path(tmp_path)
-    path = legacy_json_path(hass, "entry-distance")
-    _write_legacy_snapshot(
-        path,
-        json.dumps(
-            {
-                ATTR_CITY: "Legacy City",
-                "distance_from_home_m": 12.5,
-                "distance_traveled_m": 3.25,
-            }
-        ),
-    )
-
-    await async_migrate_legacy_snapshot(hass, "entry-distance", "Test Place")
-
-    assert _FakeStore.saved == [
-        {
-            ATTR_CITY: "Legacy City",
-            ATTR_DISTANCE_FROM_HOME: 12.5,
-            ATTR_DISTANCE_TRAVELED: 3.25,
-        }
-    ]
     assert not path.exists()
     assert not path.parent.exists()
 
