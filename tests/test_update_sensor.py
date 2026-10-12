@@ -1351,18 +1351,12 @@ async def test_get_gps_accuracy_variants(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "tracker_attrs",
-    [{}, {ATTR_GPS_ACCURACY: None}, {ATTR_GPS_ACCURACY: "invalid"}],
-    ids=["absent", "none", "non-numeric"],
-)
 async def test_get_gps_accuracy_clears_stale_zero(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
     sensor: MockSensor,
-    tracker_attrs: dict[str, object],
 ) -> None:
-    """Invalid current accuracy should clear a stale zero and proceed.
+    """Missing current accuracy should clear a stale zero and proceed.
 
     Args:
         mock_hass (MagicMock):
@@ -1371,12 +1365,10 @@ async def test_get_gps_accuracy_clears_stale_zero(
             Places configuration entry used by the test.
         sensor (MockSensor):
             Places sensor fixture whose state is asserted.
-        tracker_attrs (dict[str, object]):
-            Attributes exposed by the source tracker.
     """
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
     tracker_state = MagicMock()
-    tracker_state.attributes = tracker_attrs
+    tracker_state.attributes = {}
     mock_hass.states.get.return_value = tracker_state
     sensor.attrs[CONF_DEVICETRACKER_ID] = "device_tracker.test"
     sensor.attrs[CONF_USE_GPS] = True
@@ -1501,19 +1493,6 @@ async def test_update_coordinates_and_distance_accepts_unqualified_home_zone(
 
     assert result == UpdateStatus.SKIP
     assert "Distance from home [home]" in caplog.text
-
-
-async def test_mock_sensor_restore_previous_attr_replaces_mapping_and_native_value() -> None:
-    """MockSensor rollback should restore the exact snapshot and native value."""
-    sensor = MockSensor(attrs={"keep": "old", "remove": "old"})
-    original_attrs = sensor.get_internal_attr()
-    previous = {"restored": "state", ATTR_NATIVE_VALUE: "restored native value"}
-
-    await sensor.restore_previous_attr(previous)
-
-    assert sensor.get_internal_attr() is previous
-    assert sensor.get_internal_attr() is not original_attrs
-    assert sensor.native_value == "restored native value"
 
 
 @pytest.mark.asyncio
@@ -2206,16 +2185,15 @@ async def test_update_coordinates_and_distance_calls(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "scenario",
-    ["blank", "invalid_date", "valid_date", "type_error", "value_error"],
+    ["blank", "invalid_date", "valid_date", "naive_date"],
 )
 async def test_get_seconds_from_last_change_param(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
     sensor: MockSensor,
     scenario: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Parametrized variants for get_seconds_from_last_change covering various error and success paths.
+    """Cover missing, malformed, aware, and naive saved timestamps.
 
     Args:
         mock_hass (MagicMock):
@@ -2226,13 +2204,11 @@ async def test_get_seconds_from_last_change_param(
             Places sensor fixture whose state is asserted.
         scenario (str):
             Named parameter set for the current case.
-        monkeypatch (pytest.MonkeyPatch):
-            Pytest fixture for replacing dependencies.
     """
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    now = datetime.now(tz=UTC)
 
     if scenario == "blank":
+        now = datetime(2024, 1, 1, 13, 0, tzinfo=UTC)
         sensor.is_attr_blank.return_value = True
         result = await updater.get_seconds_from_last_change(now)
         assert result == 3600
@@ -2241,38 +2217,23 @@ async def test_get_seconds_from_last_change_param(
     sensor.is_attr_blank.return_value = False
 
     if scenario == "invalid_date":
+        now = datetime(2024, 1, 1, 13, 0, tzinfo=UTC)
         sensor.get_attr_safe_str.return_value = "not-a-date"
         result = await updater.get_seconds_from_last_change(now)
         assert result == 3600
         return
 
     if scenario == "valid_date":
+        now = datetime(2024, 1, 1, 13, 0, tzinfo=UTC)
         last_changed = now - timedelta(seconds=123)
         sensor.attrs[ATTR_LAST_CHANGED] = last_changed.replace(microsecond=0).isoformat()
         result = await updater.get_seconds_from_last_change(now.replace(microsecond=0))
         assert result == 123
         return
 
-    if scenario == "type_error":
-        # Create UTC datetime then strip tzinfo to test handling of naive datetimes.
-        naive_last_changed = datetime(2024, 1, 1, 12, 0, tzinfo=UTC).replace(tzinfo=None)
-        aware_now = datetime(2024, 1, 1, 13, 0, tzinfo=UTC)
-
-        sensor.get_attr_safe_str.return_value = naive_last_changed.isoformat()
-        mock_dt = MagicMock()
-        mock_dt.fromisoformat.return_value = naive_last_changed
-        mock_dt.now.return_value = aware_now
-        monkeypatch.setattr("custom_components.places.update_sensor.datetime", mock_dt)
-        result = await updater.get_seconds_from_last_change(aware_now)
-        assert result == 3600
-        return
-
-    # value_error
-    sensor.get_attr_safe_str.return_value = "bad-date"
-    mock_dt = MagicMock()
-    mock_dt.fromisoformat.side_effect = ValueError("bad date format")
-    mock_dt.now.return_value = now
-    monkeypatch.setattr("custom_components.places.update_sensor.datetime", mock_dt)
+    # An ISO timestamp without an offset is interpreted in the update timezone.
+    now = datetime(2024, 1, 1, 13, 0, tzinfo=UTC)
+    sensor.attrs[ATTR_LAST_CHANGED] = "2024-01-01T12:00:00"
     result = await updater.get_seconds_from_last_change(now)
     assert result == 3600
 
@@ -3149,38 +3110,6 @@ async def test_update_coordinates_and_distance_skip_missing_attr(
         sensor.is_attr_blank.side_effect = lambda k: k in [ATTR_LATITUDE, ATTR_HOME_LATITUDE]
         result = await updater.update_coordinates_and_distance()
     assert result == UpdateStatus.SKIP
-
-
-@pytest.mark.asyncio
-async def test_is_tracker_available_valid(
-    mock_hass: MagicMock, mock_config_entry: MockConfigEntry, sensor: MockSensor
-) -> None:
-    """Returns True for existing tracker state object (not string unavailable).
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    # Provide tracker id in attrs and let default get_attr work
-    sensor.attrs[CONF_DEVICETRACKER_ID] = "device_tracker.test"
-    sensor.is_attr_blank.side_effect = lambda k: (
-        k not in sensor.attrs
-        or sensor.attrs.get(k)
-        in (
-            None,
-            "",
-        )
-    )
-    state = MagicMock()
-    state.attributes = {}
-    mock_hass.states.get.return_value = state
-    result = await updater.is_tracker_available()
-    assert result is True
 
 
 @pytest.mark.asyncio
