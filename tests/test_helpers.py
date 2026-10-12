@@ -5,9 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 import re
 from typing import Protocol
-from unittest.mock import MagicMock
 
-import aiohttp
 from aioplaces import HTTPError, JSONMapping, PlacesClient
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -89,46 +87,6 @@ def test_is_float_param(value: object, expected: bool) -> None:
             Expected result for this parametrized case.
     """
     assert helpers.is_float(value) is expected
-
-
-def test_ensure_places_client_reuses_instance_and_borrows_shared_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """All Places entries on one Home Assistant instance use one client.
-
-    Args:
-        monkeypatch (pytest.MonkeyPatch): Scoped replacement for the session getter.
-    """
-    session = MagicMock(spec=aiohttp.ClientSession)
-    get_session = MagicMock(return_value=session)
-    monkeypatch.setattr(helpers, "async_get_clientsession", get_session)
-    hass = MagicMock()
-    hass.data = {}
-
-    first_client = helpers._ensure_places_client(hass)
-    second_client = helpers._ensure_places_client(hass)
-
-    assert first_client is second_client
-    assert hass.data[DOMAIN][PLACES_CLIENT] is first_client
-    get_session.assert_called_once_with(hass)
-
-
-def test_ensure_places_client_preserves_existing_instance(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Do not replace a client already stored by another config entry.
-
-    Args:
-        monkeypatch (pytest.MonkeyPatch): Scoped replacement for the session getter.
-    """
-    get_session = MagicMock()
-    monkeypatch.setattr(helpers, "async_get_clientsession", get_session)
-    existing_client = MagicMock()
-    hass = MagicMock()
-    hass.data = {DOMAIN: {PLACES_CLIENT: existing_client}}
-
-    assert helpers._ensure_places_client(hass) is existing_client
-    get_session.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -244,12 +202,12 @@ async def test_places_client_caches_success_and_force_fetches_fresh_data(
     client = _make_places_client(hass)
 
     first = await client.reverse(40.7, -73.9)
+    assert first == payload
+    first["display_name"] = "Changed by caller"
     cached = await client.reverse(40.7, -73.9)
     fresh = await client.reverse(40.7, -73.9, use_cache=False)
 
-    assert first == payload
     assert cached == payload
-    assert cached is not first
     assert fresh == payload
     assert aioclient_mock.call_count == 2
 

@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
-from aioplaces import PlacesError
+from aioplaces import PlacesClient, PlacesError
 from homeassistant.const import (
     ATTR_FRIENDLY_NAME,
     ATTR_GPS_ACCURACY,
@@ -61,11 +61,8 @@ from custom_components.places.const import (
     CONF_MAP_PROVIDER,
     CONF_SHOW_TIME,
     CONF_USE_GPS,
-    DOMAIN,
-    PLACES_CLIENT,
     UpdateStatus,
 )
-from custom_components.places.helpers import _ensure_places_client
 from custom_components.places.sensor import Places
 from custom_components.places.update_sensor import PlacesUpdater
 from tests.conftest import (
@@ -138,10 +135,8 @@ async def test_failed_lookup_retries_without_more_movement(
         "type": "city",
         "address": {"city": "London", "country": "United Kingdom", "country_code": "gb"},
     }
-    client = _ensure_places_client(mock_hass)
-    assert mock_hass.data[DOMAIN][PLACES_CLIENT] is client
     reverse = AsyncMock(side_effect=[payload, payload, None, payload])
-    monkeypatch.setattr(client, "reverse", reverse)
+    monkeypatch.setattr(PlacesClient, "reverse", reverse)
 
     await coordinator._run_update("Test")
     original_state = coordinator.data.native_value
@@ -2538,7 +2533,7 @@ async def test_query_osm_and_finalize_calls_place_client_and_updates_state(
     )
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
     reverse = AsyncMock(return_value={"osm_id": 5, "display_name": "Central Park"})
-    monkeypatch.setattr(updater._places_client, "reverse", reverse)
+    monkeypatch.setattr(PlacesClient, "reverse", reverse)
     mock_parser = AsyncMock()
     mock_parser_cls = MagicMock(return_value=mock_parser)
     monkeypatch.setattr("custom_components.places.update_sensor.OSMParser", mock_parser_cls)
@@ -2791,23 +2786,36 @@ async def test_get_initial_last_place_name_not_in_zone_blank_keeps_previous(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [None, ValueError("invalid coordinates"), PlacesError("service unavailable")],
+    ids=("no-result", "invalid-response", "request-error"),
+)
 async def test_query_osm_and_finalize_skips_parser_when_lookup_has_no_result(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
     sensor: MockSensor,
     monkeypatch: pytest.MonkeyPatch,
+    response: dict[str, object] | ValueError | PlacesError | None,
 ) -> None:
-    """An empty reverse lookup leaves the update timestamp and parser untouched.
+    """No-result and failed lookups clear stale data without parsing or timestamping.
 
     Args:
         mock_hass (MagicMock): Mocked Home Assistant runtime.
         mock_config_entry (MockConfigEntry): Entry used to configure the updater.
         sensor (MockSensor): Sensor receiving place attributes.
         monkeypatch (pytest.MonkeyPatch): Scoped client and parser replacements.
+        response (dict[str, object] | ValueError | PlacesError | None): Lookup outcome.
     """
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    reverse = AsyncMock(return_value=None)
-    monkeypatch.setattr(updater._places_client, "reverse", reverse)
+    reverse = (
+        AsyncMock(side_effect=response)
+        if isinstance(response, Exception)
+        else AsyncMock(return_value=response)
+    )
+    monkeypatch.setattr(PlacesClient, "reverse", reverse)
+    sensor.attrs[ATTR_OSM_DICT] = {"stale": True}
+    sensor.attrs[ATTR_LAST_CHANGED] = "2024-01-01 11:00:00+00:00"
     sensor.blank_attrs.add(ATTR_OSM_DICT)
     mock_parser_cls = MagicMock()
     monkeypatch.setattr("custom_components.places.update_sensor.OSMParser", mock_parser_cls)
@@ -2817,8 +2825,8 @@ async def test_query_osm_and_finalize_skips_parser_when_lookup_has_no_result(
 
     reverse.assert_awaited_once()
     assert sensor.attrs[ATTR_OSM_DICT] == {}
+    assert sensor.attrs[ATTR_LAST_CHANGED] == "2024-01-01 11:00:00+00:00"
     mock_parser_cls.assert_not_called()
-    assert ATTR_LAST_CHANGED not in sensor.attrs
 
 
 @pytest.mark.asyncio
@@ -2934,7 +2942,7 @@ async def test_get_extended_attr_uses_library_lookup_for_supported_types(
     sensor.attrs.update({CONF_API_KEY: "contact@example.test", CONF_LANGUAGE: "en"})
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
     lookup = AsyncMock(side_effect=error) if error is not None else AsyncMock(return_value=None)
-    monkeypatch.setattr(updater._places_client, "lookup", lookup)
+    monkeypatch.setattr(PlacesClient, "lookup", lookup)
 
     await updater.get_extended_attr()
 
@@ -2970,8 +2978,8 @@ async def test_get_extended_attr_follows_wikidata_reference(
     lookup = AsyncMock(return_value={"extratags": {"wikidata": "Q123"}})
     wikidata_payload = {"entities": {"Q123": {"labels": {"en": {"value": "Example"}}}}}
     wikidata = AsyncMock(return_value=wikidata_payload)
-    monkeypatch.setattr(updater._places_client, "lookup", lookup)
-    monkeypatch.setattr(updater._places_client, "wikidata", wikidata)
+    monkeypatch.setattr(PlacesClient, "lookup", lookup)
+    monkeypatch.setattr(PlacesClient, "wikidata", wikidata)
 
     await updater.get_extended_attr()
 
@@ -2979,33 +2987,6 @@ async def test_get_extended_attr_follows_wikidata_reference(
     wikidata.assert_awaited_once_with("Q123", use_cache=True)
     assert sensor.attrs[ATTR_WIKIDATA_ID] == "Q123"
     assert sensor.attrs[ATTR_WIKIDATA_DICT] == wikidata_payload
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("error", [ValueError("invalid coordinates"), PlacesError("service down")])
-async def test_get_place_data_clears_payload_when_client_fails(
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    sensor: MockSensor,
-    error: Exception,
-) -> None:
-    """Convert client validation and service failures to an empty response attribute.
-
-    Args:
-        mock_hass (MagicMock): Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry): Entry used to configure the updater.
-        sensor (MockSensor): Sensor holding the stale payload being cleared.
-        error (Exception): Client error raised by the supplied request coroutine.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    sensor.attrs[ATTR_OSM_DICT] = {"stale": True}
-
-    async def fail_request() -> dict[str, object] | None:
-        raise error
-
-    await updater._get_place_data(fail_request(), "OpenStreetMap", ATTR_OSM_DICT)
-
-    assert sensor.attrs[ATTR_OSM_DICT] == {}
 
 
 @pytest.mark.asyncio

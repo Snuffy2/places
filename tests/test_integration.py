@@ -1448,7 +1448,7 @@ async def test_runtime_data_isolation(
     monkeypatch: pytest.MonkeyPatch,
     mock_hass: MagicMock,
 ) -> None:
-    """Each config entry should receive its own coordinator instance.
+    """Entries get separate coordinators while sharing the API client.
 
     Args:
         monkeypatch (pytest.MonkeyPatch):
@@ -1462,11 +1462,14 @@ async def test_runtime_data_isolation(
     monkeypatch.setattr("custom_components.places.PlacesUpdateCoordinator", _FakeCoordinator)
 
     await async_setup_entry(mock_hass, entry1)
+    places_client = mock_hass.data[DOMAIN][PLACES_CLIENT]
     await async_setup_entry(mock_hass, entry2)
 
     assert isinstance(entry1.runtime_data, _FakeCoordinator)
     assert isinstance(entry2.runtime_data, _FakeCoordinator)
     assert entry1.runtime_data is not entry2.runtime_data
+    assert isinstance(places_client, PlacesClient)
+    assert mock_hass.data[DOMAIN][PLACES_CLIENT] is places_client
 
 
 @pytest.mark.asyncio
