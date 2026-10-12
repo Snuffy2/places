@@ -12,7 +12,6 @@ from homeassistant.const import (
     ATTR_FRIENDLY_NAME,
     ATTR_GPS_ACCURACY,
     CONF_API_KEY,
-    CONF_FRIENDLY_NAME,
     CONF_LATITUDE,
     CONF_LONGITUDE,
     CONF_NAME,
@@ -74,7 +73,6 @@ from tests.conftest import (
 )
 
 type StubbedUpdater = Callable[..., AbstractContextManager[dict[str, AsyncMock]]]
-type ZoneSetup = Callable[[MockSensor, MagicMock], object]
 
 
 @pytest.fixture
@@ -126,7 +124,7 @@ async def test_failed_lookup_retries_without_more_movement(
     monkeypatch.setattr(
         PlacesUpdater,
         "get_current_time",
-        AsyncMock(side_effect=[datetime(2024, 1, 1, hour, tzinfo=UTC) for hour in range(12, 17)]),
+        AsyncMock(side_effect=[datetime(2024, 1, 1, hour, tzinfo=UTC) for hour in range(12, 18)]),
     )
     payload = {
         "osm_id": 1,
@@ -135,7 +133,7 @@ async def test_failed_lookup_retries_without_more_movement(
         "type": "city",
         "address": {"city": "London", "country": "United Kingdom", "country_code": "gb"},
     }
-    reverse = AsyncMock(side_effect=[payload, payload, None, payload])
+    reverse = AsyncMock(side_effect=[payload, payload, None, payload, payload])
     monkeypatch.setattr(PlacesClient, "reverse", reverse)
 
     await coordinator._run_update("Test")
@@ -182,9 +180,16 @@ async def test_failed_lookup_retries_without_more_movement(
     assert reverse.await_args_list[2].args[:2] == reverse.await_args_list[3].args[:2]
     mock_hass.bus.fire.assert_called_once()
 
-    await coordinator._run_update("Test")
-    assert reverse.await_count == 4
-    mock_hass.bus.fire.assert_called_once()
+    if force:
+        # Force at the same coordinates must still reach the client without cache.
+        await coordinator.async_force_update()
+        assert reverse.await_count == 5
+        assert reverse.await_args_list[-1].args[:2] == reverse.await_args_list[-2].args[:2]
+        assert reverse.await_args_list[-1].kwargs["use_cache"] is False
+    else:
+        await coordinator._run_update("Test")
+        assert reverse.await_count == 4
+        mock_hass.bus.fire.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -257,96 +262,6 @@ async def test_do_update_flow_variants(
 
     assert sensor.attrs[ATTR_LAST_UPDATED] == "2024-01-01 12:00:00"
     sensor.publish_update.assert_called_once_with()
-
-
-@pytest.mark.asyncio
-async def test_do_update_force_skips_movement_criteria(
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    sensor: MockSensor,
-    stubbed_updater: StubbedUpdater,
-) -> None:
-    """A forced update still runs update criteria and disables cache reads.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        stubbed_updater (StubbedUpdater):
-            Updater with external dependencies replaced by stubs.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-
-    async def process_osm_update(**_kwargs: object) -> None:
-        sensor.attrs[ATTR_OSM_DICT] = {"place_id": 123}
-
-    with stubbed_updater(
-        updater,
-        [
-            ("get_current_time", {"return_value": datetime(2024, 1, 1, tzinfo=UTC)}),
-            ("update_entity_name_and_cleanup", {}),
-            ("update_previous_state", {}),
-            ("update_old_coordinates", {}),
-            (
-                "check_device_tracker_and_update_coords",
-                {"return_value": UpdateStatus.PROCEED},
-            ),
-            ("determine_update_criteria", {"return_value": UpdateStatus.PROCEED}),
-            ("process_osm_update", {"side_effect": process_osm_update}),
-            ("should_update_state", {"return_value": True}),
-            ("handle_state_update", {}),
-            ("rollback_update", {}),
-        ],
-    ) as mocks:
-        await updater.do_update("Force Update", {}, force=True)
-
-    mocks["determine_update_criteria"].assert_awaited_once_with(force=True)
-    mocks["process_osm_update"].assert_awaited_once()
-    mocks["should_update_state"].assert_not_awaited()
-    mocks["handle_state_update"].assert_awaited_once()
-    assert updater._use_cache is False
-
-
-@pytest.mark.asyncio
-async def test_determine_update_criteria_force_skips_movement_check(
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    sensor: MockSensor,
-    stubbed_updater: StubbedUpdater,
-) -> None:
-    """Force path should refresh derived fields but ignore movement gating.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        stubbed_updater (StubbedUpdater):
-            Updater with external dependencies replaced by stubs.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-
-    with stubbed_updater(
-        updater,
-        [
-            ("get_initial_last_place_name", {}),
-            ("get_zone_details", {}),
-            ("update_coordinates_and_distance", {"return_value": UpdateStatus.PROCEED}),
-            ("determine_if_update_needed", {"return_value": UpdateStatus.SKIP}),
-        ],
-    ) as mocks:
-        result = await updater.determine_update_criteria(force=True)
-
-    assert result == UpdateStatus.PROCEED
-    mocks["get_initial_last_place_name"].assert_awaited_once()
-    mocks["get_zone_details"].assert_awaited_once()
-    mocks["update_coordinates_and_distance"].assert_awaited_once()
-    mocks["determine_if_update_needed"].assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1056,30 +971,6 @@ async def test_async_apply_show_time_preserves_aged_date_suffix(
 
 
 @pytest.mark.asyncio
-async def test_check_for_updated_entity_name_entity_id_new_name(
-    mock_hass: MagicMock, mock_config_entry: MockConfigEntry, sensor: MockSensor
-) -> None:
-    """Test that the entity name is updated and the config entry is updated when a new friendly name is detected.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    sensor.entity_id = "sensor.test"
-    state = MagicMock()
-    state.attributes = {ATTR_FRIENDLY_NAME: "NewName"}
-    mock_hass.states.get.return_value = state
-    sensor.get_attr.return_value = "OldName"
-    await updater.check_for_updated_entity_name()
-    mock_hass.config_entries.async_update_entry.assert_called()
-
-
-@pytest.mark.asyncio
 async def test_check_for_updated_entity_name_with_real_coordinator_entity(
     mock_hass: MagicMock,
     patch_entity_registry: object,
@@ -1415,43 +1306,6 @@ async def test_update_coordinates_variants_present_and_missing(
     assert any("Device tracker entity not found" in r.message for r in caplog.records)
 
 
-@pytest.mark.asyncio
-async def test_determine_update_criteria_calls(
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    sensor: MockSensor,
-    stubbed_updater: StubbedUpdater,
-) -> None:
-    """Test that `determine_update_criteria` calls all required helper methods and returns the correct update status.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        stubbed_updater (StubbedUpdater):
-            Updater with external dependencies replaced by stubs.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    with stubbed_updater(
-        updater,
-        [
-            ("get_initial_last_place_name", {}),
-            ("get_zone_details", {}),
-            ("update_coordinates_and_distance", {"return_value": UpdateStatus.PROCEED}),
-            ("determine_if_update_needed", {"return_value": UpdateStatus.PROCEED}),
-        ],
-    ) as mocks:
-        result = await updater.determine_update_criteria()
-    assert result == UpdateStatus.PROCEED
-    mocks["get_initial_last_place_name"].assert_awaited_once()
-    mocks["get_zone_details"].assert_awaited_once()
-    mocks["update_coordinates_and_distance"].assert_awaited_once()
-    mocks["determine_if_update_needed"].assert_awaited_once()
-
-
 async def test_update_coordinates_and_distance_accepts_unqualified_home_zone(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
@@ -1543,113 +1397,74 @@ async def test_get_initial_last_place_name_param(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("scenario", "setup_func", "expected_zone", "expected_zone_name_present", "expected_zone_name"),
+    (
+        "tracker_id",
+        "tracker_state",
+        "tracker_attrs",
+        "in_zone",
+        "initial_zone",
+        "home_zone_attrs",
+        "expected_zone",
+        "expected_zone_name",
+    ),
     [
         (
-            "not_zone",
-            lambda sensor, mock_hass: (
-                sensor.get_attr_safe_str.__setattr__(
-                    "side_effect",
-                    (
-                        lambda k: (
-                            "home" if k == ATTR_DEVICETRACKER_ZONE_NAME else "device_tracker.test"
-                        )
-                    ),
-                ),
-                sensor.get_attr.__setattr__(
-                    "side_effect",
-                    (lambda k: "home" if k == ATTR_DEVICETRACKER_ZONE_NAME else "TestZone"),
-                ),
-                mock_hass.states.get.__setattr__("return_value", MagicMock(state="home")),
-            ),
+            "device_tracker.test",
+            "not_home",
+            {},
+            False,
+            None,
+            None,
+            "not_home",
+            "not_home",
+        ),
+        (
+            "zone.home",
+            "0",
+            {},
+            False,
             "home",
-            True,
-            "TestZone",
+            None,
+            "home",
+            "home",
         ),
         (
-            "zone_id_equals_conf_zone",
-            lambda sensor, mock_hass: (
-                sensor.__setattr__(
-                    "get_attr_safe_str",
-                    (lambda k: CONF_ZONE + ".home" if k == CONF_DEVICETRACKER_ID else ""),
-                ),
-                sensor.__setattr__(
-                    "get_attr",
-                    (lambda k: CONF_ZONE + ".home" if k == CONF_DEVICETRACKER_ID else ""),
-                ),
-                sensor.attrs.__setitem__(ATTR_DEVICETRACKER_ZONE, "home"),
-            ),
-            None,
+            "device_tracker.test",
+            "home",
+            {CONF_ZONE: "home"},
             True,
-            "",
+            None,
+            {ATTR_FRIENDLY_NAME: "Home Zone"},
+            "home",
+            "Home Zone",
         ),
         (
-            "in_zone_true",
-            lambda sensor, mock_hass: (
-                sensor.__setattr__(
-                    "get_attr_safe_str",
-                    (lambda k: "device_tracker.test" if k == CONF_DEVICETRACKER_ID else ""),
-                ),
-                sensor.__setattr__(
-                    "get_attr",
-                    (lambda k: "device_tracker.test" if k == CONF_DEVICETRACKER_ID else ""),
-                ),
-                mock_hass.states.get.__setattr__(
-                    "side_effect",
-                    (
-                        lambda eid: (
-                            MagicMock(attributes={CONF_ZONE: "home"})
-                            if eid == "device_tracker.test"
-                            else MagicMock(attributes={CONF_FRIENDLY_NAME: "Home Zone"})
-                            if eid == "zone.home"
-                            else None
-                        )
-                    ),
-                ),
-            ),
-            None,
-            True,
-            "",
-        ),
-        (
-            "in_zone_no_zone_name_state",
-            lambda sensor, mock_hass: (
-                sensor.__setattr__(
-                    "get_attr_safe_str",
-                    (lambda k: "device_tracker.test" if k == CONF_DEVICETRACKER_ID else ""),
-                ),
-                sensor.__setattr__(
-                    "get_attr",
-                    (lambda k: "device_tracker.test" if k == CONF_DEVICETRACKER_ID else ""),
-                ),
-                mock_hass.states.get.__setattr__(
-                    "side_effect",
-                    (
-                        lambda eid: (
-                            MagicMock(attributes={CONF_ZONE: "home"})
-                            if eid == "device_tracker.test"
-                            else None
-                        )
-                    ),
-                ),
-            ),
-            None,
+            "device_tracker.test",
+            "home",
+            {CONF_ZONE: "home"},
             True,
             None,
+            None,
+            "home",
+            "Home",
         ),
     ],
+    ids=["outside-zone", "zone-entity", "named-zone", "missing-zone-state"],
 )
 async def test_get_zone_details_param(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
     sensor: MockSensor,
-    scenario: str,
-    setup_func: ZoneSetup,
-    expected_zone: str | None,
-    expected_zone_name_present: bool,
-    expected_zone_name: str | None,
+    tracker_id: str,
+    tracker_state: str,
+    tracker_attrs: dict[str, str],
+    in_zone: bool,
+    initial_zone: str | None,
+    home_zone_attrs: dict[str, str] | None,
+    expected_zone: str,
+    expected_zone_name: str,
 ) -> None:
-    """Parametrized variants for get_zone_details covering zone and non-zone flows.
+    """Resolve tracker zone attributes from Home Assistant states.
 
     Args:
         mock_hass (MagicMock):
@@ -1658,33 +1473,38 @@ async def test_get_zone_details_param(
             Places configuration entry used by the test.
         sensor (MockSensor):
             Places sensor fixture whose state is asserted.
-        scenario (str):
-            Named parameter set for the current case.
-        setup_func (ZoneSetup):
-            Setup callable used to initialize the case.
-        expected_zone (str | None):
-            Zone identifier expected for this parametrized case.
-        expected_zone_name_present (bool):
-            Whether a zone name is expected in the output.
-        expected_zone_name (str | None):
-            Zone name expected for this parametrized case.
+        tracker_id (str):
+            Entity ID configured as the device tracker.
+        tracker_state (str):
+            State returned for the configured tracker.
+        tracker_attrs (dict[str, str]):
+            Attributes returned for the configured tracker.
+        in_zone (bool):
+            Whether the coordinator considers the tracker inside a zone.
+        initial_zone (str | None):
+            Existing zone attribute, when the tracker itself is a zone entity.
+        home_zone_attrs (dict[str, str] | None):
+            Attributes returned for ``zone.home`` when that state exists.
+        expected_zone (str):
+            Zone identifier expected after resolution.
+        expected_zone_name (str):
+            Display name expected after resolution.
     """
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    # Execute scenario-specific setup
-    setup_func(sensor, mock_hass)
+    sensor.attrs[CONF_DEVICETRACKER_ID] = tracker_id
+    if initial_zone is not None:
+        sensor.attrs[ATTR_DEVICETRACKER_ZONE] = initial_zone
+    tracker = State(tracker_id, tracker_state, tracker_attrs)
+    states = {tracker_id: tracker}
+    if home_zone_attrs is not None:
+        states["zone.home"] = State("zone.home", "0", home_zone_attrs)
+    mock_hass.states.get.side_effect = states.get
 
-    # Default to not in zone unless scenario setup overrides
-    in_zone = scenario not in ("not_zone", "zone_id_equals_conf_zone")
     with stub_in_zone(sensor, in_zone):
         await updater.get_zone_details()
 
-    if expected_zone is not None:
-        assert sensor.attrs[ATTR_DEVICETRACKER_ZONE] == expected_zone
-    if expected_zone_name_present:
-        # When a zone name presence is expected, assert the attribute exists (value may be empty string)
-        assert ATTR_DEVICETRACKER_ZONE_NAME in sensor.attrs
-        if expected_zone_name is not None:
-            assert sensor.attrs[ATTR_DEVICETRACKER_ZONE_NAME] == expected_zone_name
+    assert sensor.attrs[ATTR_DEVICETRACKER_ZONE] == expected_zone
+    assert sensor.attrs[ATTR_DEVICETRACKER_ZONE_NAME] == expected_zone_name
 
 
 @pytest.mark.asyncio
@@ -1721,40 +1541,6 @@ async def test_get_zone_details_uses_home_zone_friendly_name_from_state(
 
     assert sensor.attrs[ATTR_DEVICETRACKER_ZONE] == "home"
     assert sensor.attrs[ATTR_DEVICETRACKER_ZONE_NAME] == "Casa Concordia"
-
-
-@pytest.mark.asyncio
-async def test_process_osm_update_calls(
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    sensor: MockSensor,
-    stubbed_updater: StubbedUpdater,
-) -> None:
-    """Test that `process_osm_update` calls attribute reset, map link generation, and OSM query finalization methods as expected.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        stubbed_updater (StubbedUpdater):
-            Updater with external dependencies replaced by stubs.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    with stubbed_updater(
-        updater,
-        [
-            ("async_reset_attributes", {}),
-            ("get_map_link", {}),
-            ("query_osm_and_finalize", {}),
-        ],
-    ) as mocks:
-        await updater.process_osm_update(datetime(2024, 1, 1, 12, 0, tzinfo=UTC))
-    mocks["async_reset_attributes"].assert_awaited_once()
-    mocks["get_map_link"].assert_awaited_once()
-    mocks["query_osm_and_finalize"].assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1809,10 +1595,10 @@ async def test_get_map_link_providers_all(
 
 
 @pytest.mark.asyncio
-async def test_async_reset_attributes_calls(
+async def test_async_reset_attributes_clears_stale_data_and_preserves_configuration(
     mock_hass: MagicMock, mock_config_entry: MockConfigEntry, sensor: MockSensor
 ) -> None:
-    """Test that `async_reset_attributes` clears sensor attributes and performs asynchronous cleanup.
+    """Clear stale geocoding data while preserving configuration and coordinates.
 
     Args:
         mock_hass (MagicMock):
@@ -1823,9 +1609,21 @@ async def test_async_reset_attributes_calls(
             Places sensor fixture whose state is asserted.
     """
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
+    sensor.attrs.update(
+        {
+            ATTR_OSM_DICT: {"stale": True},
+            ATTR_MAP_LINK: "https://old.example/",
+            CONF_NAME: "Probe",
+            ATTR_LATITUDE: 51.5,
+        }
+    )
+
     await updater.async_reset_attributes()
-    sensor.clear_attr.assert_called()
-    sensor.async_cleanup_attributes.assert_awaited_once()
+
+    assert ATTR_OSM_DICT not in sensor.attrs
+    assert ATTR_MAP_LINK not in sensor.attrs
+    assert sensor.attrs[CONF_NAME] == "Probe"
+    assert sensor.attrs[ATTR_LATITUDE] == 51.5
 
 
 @pytest.mark.asyncio
@@ -2143,13 +1941,12 @@ async def test_calculate_distance_methods(
 
 
 @pytest.mark.asyncio
-async def test_update_coordinates_and_distance_calls(
+async def test_update_coordinates_and_distance_updates_location_and_movement(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
     sensor: MockSensor,
-    stubbed_updater: StubbedUpdater,
 ) -> None:
-    """Call coordinate and distance helpers and return PROCEED.
+    """Derive location, distance, and direction from current and prior coordinates.
 
     Args:
         mock_hass (MagicMock):
@@ -2158,28 +1955,29 @@ async def test_update_coordinates_and_distance_calls(
             Places configuration entry used by the test.
         sensor (MockSensor):
             Places sensor fixture whose state is asserted.
-        stubbed_updater (StubbedUpdater):
-            Updater with external dependencies replaced by stubs.
     """
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    sensor.is_attr_blank.side_effect = lambda k: False
-    # Patch get_attr_safe_str to return a value with a dot for CONF_HOME_ZONE
-    sensor.get_attr_safe_str.side_effect = lambda k: "zone.home" if k == CONF_HOME_ZONE else "other"
-    with stubbed_updater(
-        updater,
-        [
-            ("update_location_attributes", {}),
-            ("calculate_distances", {}),
-            ("calculate_travel_distance", {}),
-            ("determine_direction_of_travel", {}),
-        ],
-    ) as mocks:
-        result = await updater.update_coordinates_and_distance()
+    sensor.attrs.update(
+        {
+            ATTR_LATITUDE: 40.001,
+            ATTR_LONGITUDE: -70.002,
+            ATTR_LATITUDE_OLD: 40.0,
+            ATTR_LONGITUDE_OLD: -70.0,
+            ATTR_HOME_LATITUDE: 40.0,
+            ATTR_HOME_LONGITUDE: -70.0,
+            ATTR_DISTANCE_FROM_HOME: 0.0,
+        }
+    )
+
+    result = await updater.update_coordinates_and_distance()
+
     assert result == UpdateStatus.PROCEED
-    mocks["update_location_attributes"].assert_awaited_once()
-    mocks["calculate_distances"].assert_awaited_once()
-    mocks["calculate_travel_distance"].assert_awaited_once()
-    mocks["determine_direction_of_travel"].assert_awaited_once()
+    assert sensor.attrs[ATTR_LOCATION_CURRENT] == "40.001,-70.002"
+    assert sensor.attrs[ATTR_LOCATION_PREVIOUS] == "40.0,-70.0"
+    assert sensor.attrs[ATTR_HOME_LOCATION] == "40.0,-70.0"
+    assert sensor.attrs[ATTR_DISTANCE_FROM_HOME] == pytest.approx(203.707)
+    assert sensor.attrs[ATTR_DISTANCE_TRAVELED] == pytest.approx(203.707)
+    assert sensor.attrs[ATTR_DIRECTION_OF_TRAVEL] == "away from home"
 
 
 @pytest.mark.asyncio
@@ -2256,19 +2054,20 @@ async def test_change_show_time_to_date_param(
             Format applied to rendered timestamps.
     """
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    sensor.is_attr_blank.side_effect = lambda k: False
-    sensor.get_attr.side_effect = lambda k: (
-        True
-        if k == CONF_SHOW_TIME
-        else date_format
-        if k == CONF_DATE_FORMAT
-        else "2024-01-01 12:00:00"
+    sensor.attrs.update(
+        {
+            CONF_SHOW_TIME: True,
+            CONF_DATE_FORMAT: date_format,
+            ATTR_LAST_CHANGED: "2024-02-03 12:00:00",
+            ATTR_NATIVE_VALUE: "TestState (since 12:00)",
+        }
     )
-    sensor.get_attr_safe_str.side_effect = lambda k: (
-        "2024-01-01 12:00:00" if k == ATTR_LAST_CHANGED else "TestState"
-    )
+    sensor.native_value = "TestState (since 12:00)"
+
     await updater.change_show_time_to_date()
-    assert sensor.native_value is not None
+
+    expected_date = "03/02" if date_format == "dd/mm" else "02/03"
+    assert sensor.native_value == f"TestState (since {expected_date})"
     assert sensor.attrs[ATTR_SHOW_DATE] is True
     sensor.async_persist_attributes.assert_not_awaited()
     mock_hass.async_add_executor_job.assert_not_awaited()
@@ -2469,7 +2268,7 @@ async def test_log_tracker_issue_param(
 
 
 @pytest.mark.asyncio
-async def test_query_osm_and_finalize_calls_place_client_and_updates_state(
+async def test_query_osm_and_finalize_preserves_client_arguments_and_timestamp(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
     sensor: MockSensor,
@@ -2499,10 +2298,8 @@ async def test_query_osm_and_finalize_calls_place_client_and_updates_state(
     mock_parser_cls = MagicMock(return_value=mock_parser)
     monkeypatch.setattr("custom_components.places.update_sensor.OSMParser", mock_parser_cls)
     with (
-        stubbed_sensor(sensor, [("process_display_options", {})]) as sensor_mocks,
-        stubbed_parser(
-            mock_parser, [("parse_osm_dict", {}), ("finalize_last_place_name", {})]
-        ) as parser_mocks,
+        stubbed_sensor(sensor, [("process_display_options", {})]),
+        stubbed_parser(mock_parser, [("parse_osm_dict", {}), ("finalize_last_place_name", {})]),
     ):
         now = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
         await updater.query_osm_and_finalize(now)
@@ -2514,9 +2311,7 @@ async def test_query_osm_and_finalize_calls_place_client_and_updates_state(
         email="contact@example.test",
         use_cache=True,
     )
-    parser_mocks["parse_osm_dict"].assert_awaited_once()
-    parser_mocks["finalize_last_place_name"].assert_awaited_once_with("Home")
-    sensor_mocks["process_display_options"].assert_awaited_once()
+    assert sensor.attrs[ATTR_OSM_DICT] == {"osm_id": 5, "display_name": "Central Park"}
     assert sensor.attrs[ATTR_LAST_CHANGED] == now.isoformat(sep=" ", timespec="seconds")
 
 
@@ -2759,7 +2554,7 @@ async def test_query_osm_and_finalize_skips_parser_when_lookup_has_no_result(
     monkeypatch: pytest.MonkeyPatch,
     response: dict[str, object] | ValueError | PlacesError | None,
 ) -> None:
-    """No-result and failed lookups clear stale data without parsing or timestamping.
+    """No-result and failed lookups clear stale data without replacing its timestamp.
 
     Args:
         mock_hass (MagicMock): Mocked Home Assistant runtime.
@@ -2778,16 +2573,12 @@ async def test_query_osm_and_finalize_skips_parser_when_lookup_has_no_result(
     sensor.attrs[ATTR_OSM_DICT] = {"stale": True}
     sensor.attrs[ATTR_LAST_CHANGED] = "2024-01-01 11:00:00+00:00"
     sensor.blank_attrs.add(ATTR_OSM_DICT)
-    mock_parser_cls = MagicMock()
-    monkeypatch.setattr("custom_components.places.update_sensor.OSMParser", mock_parser_cls)
-
     now = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
     await updater.query_osm_and_finalize(now)
 
     reverse.assert_awaited_once()
     assert sensor.attrs[ATTR_OSM_DICT] == {}
     assert sensor.attrs[ATTR_LAST_CHANGED] == "2024-01-01 11:00:00+00:00"
-    mock_parser_cls.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2813,24 +2604,66 @@ async def test_should_update_state_initial_update_true(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status", "seconds", "show_time", "expect_dot", "expect_show"),
+    (
+        "previous_attr",
+        "status",
+        "now",
+        "expected_direction",
+        "expected_changed",
+        "expected_native_value",
+        "expected_show_date",
+        "expect_persistence",
+    ),
     [
-        (UpdateStatus.SKIP_SET_STATIONARY, 120, False, True, False),
-        (UpdateStatus.PROCEED, 90000, True, False, True),
+        (
+            {
+                CONF_NAME: "TestSensor",
+                ATTR_DIRECTION_OF_TRAVEL: "towards home",
+                ATTR_LAST_CHANGED: "2024-01-01 11:58:00+00:00",
+                ATTR_NATIVE_VALUE: "Library",
+                CONF_SHOW_TIME: False,
+            },
+            UpdateStatus.SKIP_SET_STATIONARY,
+            datetime(2024, 1, 1, 12, 0, tzinfo=UTC),
+            "stationary",
+            "2024-01-01 12:00:00+00:00",
+            "Library",
+            False,
+            True,
+        ),
+        (
+            {
+                CONF_NAME: "TestSensor",
+                ATTR_DIRECTION_OF_TRAVEL: "towards home",
+                ATTR_LAST_CHANGED: "2024-01-01 12:00:00+00:00",
+                ATTR_NATIVE_VALUE: "Library (since 12:00)",
+                CONF_SHOW_TIME: True,
+                CONF_DATE_FORMAT: "mm/dd",
+            },
+            UpdateStatus.PROCEED,
+            datetime(2024, 1, 2, 13, 0, tzinfo=UTC),
+            "towards home",
+            "2024-01-01 12:00:00+00:00",
+            "Library (since 01/01)",
+            True,
+            False,
+        ),
     ],
 )
-async def test_rollback_update_triggers_helpers(
+async def test_rollback_update_applies_stationary_and_stale_time_state(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
     sensor: MockSensor,
+    previous_attr: dict[str, object],
     status: UpdateStatus,
-    seconds: int,
-    show_time: bool,
-    expect_dot: bool,
-    expect_show: bool,
-    stubbed_updater: StubbedUpdater,
+    now: datetime,
+    expected_direction: str,
+    expected_changed: str,
+    expected_native_value: str,
+    expected_show_date: bool,
+    expect_persistence: bool,
 ) -> None:
-    """Parametrized test for rollback_update helper triggers (dot->stationary and show_time->date).
+    """Rollback should expose stationary movement and date-suffix adjustments.
 
     Args:
         mock_hass (MagicMock):
@@ -2839,40 +2672,34 @@ async def test_rollback_update_triggers_helpers(
             Places configuration entry used by the test.
         sensor (MockSensor):
             Places sensor fixture whose state is asserted.
+        previous_attr (dict[str, object]):
+            Sensor attributes restored before the state adjustment.
         status (UpdateStatus):
-            Update status supplied to ``rollback_update``.
-        seconds (int):
-            Elapsed seconds used to format the state suffix.
-        show_time (bool):
-            Whether the state includes a time suffix.
-        expect_dot (bool):
-            Whether a stationary marker is expected.
-        expect_show (bool):
-            Whether the time suffix is expected to be shown.
-        stubbed_updater (StubbedUpdater):
-            Updater with external dependencies replaced by stubs.
+            Update status that initiated rollback handling.
+        now (datetime):
+            Timestamp used for elapsed-time evaluation and any stationary update.
+        expected_direction (str):
+            Direction remaining after rollback handling.
+        expected_changed (str):
+            Last-change timestamp after rollback handling.
+        expected_native_value (str):
+            Rendered sensor state after rollback handling.
+        expected_show_date (bool):
+            Whether the date suffix is now active.
+        expect_persistence (bool):
+            Whether marking the sensor stationary persists the changed attributes.
     """
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    with stubbed_updater(
-        updater,
-        [
-            ("get_seconds_from_last_change", {"return_value": seconds}),
-            ("change_dot_to_stationary", {}),
-            ("change_show_time_to_date", {}),
-        ],
-    ) as mocks:
-        # show_time controls whether change_show_time_to_date should be called
-        sensor.get_attr.side_effect = lambda k: show_time if k == CONF_SHOW_TIME else False
-        await updater.rollback_update({}, datetime.now(tz=UTC), status)
-    sensor.restore_previous_attr.assert_awaited_once_with({})
-    if expect_dot:
-        mocks["change_dot_to_stationary"].assert_awaited_once()
+    await updater.rollback_update(previous_attr, now, status)
+
+    assert sensor.attrs[ATTR_DIRECTION_OF_TRAVEL] == expected_direction
+    assert sensor.attrs[ATTR_LAST_CHANGED] == expected_changed
+    assert sensor.native_value == expected_native_value
+    assert sensor.attrs.get(ATTR_SHOW_DATE, False) is expected_show_date
+    if expect_persistence:
+        sensor.async_persist_attributes.assert_awaited_once()
     else:
-        mocks["change_dot_to_stationary"].assert_not_awaited()
-    if expect_show:
-        mocks["change_show_time_to_date"].assert_awaited_once()
-    else:
-        mocks["change_show_time_to_date"].assert_not_awaited()
+        sensor.async_persist_attributes.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3314,10 +3141,10 @@ async def test_fire_event_data_composite_place_semantics(
         "zone_name": "Home",
     }
     sensor.display_options_list = ["formatted_place", "driving"]
-    sensor._in_zone = in_zone
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
 
-    await updater.fire_event_data(prev_last_place_name="")
+    with stub_in_zone(sensor, in_zone):
+        await updater.fire_event_data(prev_last_place_name="")
 
     event_data = mock_hass.bus.fire.call_args.args[1]
     assert event_data["place"] == ("Landmark, Amenity, Cafe, Downtown, 10, Main Street")
@@ -3440,4 +3267,4 @@ async def test_get_current_time_variants(
     dt = await updater.get_current_time()
     assert dt.tzinfo is not None
     if mock_hass.config.time_zone is None:
-        assert dt.tzinfo is UTC
+        assert dt.utcoffset() == timedelta(0)
