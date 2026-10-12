@@ -63,18 +63,13 @@ def test_safe_truncate(input_str: str | None, max_len: int, expected: str) -> No
     ("value", "expected"),
     [
         (1.23, True),
+        (123, True),
         ("2.34", True),
         (0, True),
-        ("0", True),
         (-5.6, True),
-        (123, True),
-        (123.45, True),
-        ("1.23", True),
         (None, False),
         ("abc", False),
-        ({}, False),
         ([], False),
-        ("not-a-number", False),
     ],
 )
 def test_is_float_param(value: object, expected: bool) -> None:

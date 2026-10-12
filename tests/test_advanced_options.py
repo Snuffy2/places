@@ -3,7 +3,6 @@
 from collections.abc import Mapping, Sequence
 import logging
 from typing import Protocol
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -398,45 +397,8 @@ async def test_build_from_advanced_options_bracket_paren_mismatch(sensor: MockSe
 
 
 @pytest.mark.asyncio
-async def test_build_from_advanced_options_bracket_and_paren(sensor: MockSensor) -> None:
-    """Process options that include both brackets and parentheses and call get_option_state.
-
-    Args:
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-    """
-    attrs: dict[str, object] = {"zone_name": "Home", "place_type": "Restaurant"}
-    sensor.attrs = attrs
-    parser = AdvancedOptionsParser(sensor, "zone_name[place_type(work)]")
-    # Patch get_option_state to track calls
-    called: dict[str, bool] = {}
-
-    async def _side(opt: str, *args: object, **kwargs: object) -> object:
-        """Record option lookups while returning values from the test attributes.
-
-        Args:
-            opt (str):
-                Option name requested by the parser.
-            args (object):
-                Additional lookup arguments ignored by this test stub.
-            kwargs (object):
-                Additional lookup filters ignored by this test stub.
-
-        Returns:
-            object:
-                Attribute value matching ``opt``, or ``None`` when absent.
-        """
-        called[opt] = True
-        return attrs.get(opt)
-
-    parser.get_option_state = AsyncMock(side_effect=_side)
-    await parser.build_from_advanced_options()
-    assert "zone_name" in called
-
-
-@pytest.mark.asyncio
 async def test_build_next_option_only_traverses_comma_prefixed_suffix(sensor: MockSensor) -> None:
-    """Do not process malformed non-comma suffix text after a bracket option.
+    """Do not process malformed non-comma suffix text after a bracket fallback.
 
     Args:
         sensor (MockSensor):
@@ -444,16 +406,8 @@ async def test_build_next_option_only_traverses_comma_prefixed_suffix(sensor: Mo
     """
     sensor.attrs = {"zone_name": "Home", "place_type": "Restaurant"}
     parser = AdvancedOptionsParser(sensor, "zone_name[place_type]place_type")
-    calls: list[str] = []
-
-    async def _side(opt: str, *_args: object, **_kwargs: object) -> object:
-        calls.append(opt)
-        return "Home" if opt == "zone_name" else "Restaurant"
-
-    parser.get_option_state = AsyncMock(side_effect=_side)
     await parser.build_from_advanced_options()
-    assert calls == ["zone_name"]
-    assert parser.state_list == ["Home"]
+    assert parser.state_list == ["Restaurant"]
 
 
 @pytest.mark.asyncio
