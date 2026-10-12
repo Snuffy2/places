@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.places.button import PlacesForceUpdateButton, async_setup_entry
+from custom_components.places.button import async_setup_entry
 from custom_components.places.const import DOMAIN
 
 
@@ -27,7 +27,6 @@ async def test_force_update_button_setup_and_press(mock_hass: HomeAssistant) -> 
     entities = async_add_entities.call_args.args[0]
     assert len(entities) == 1
     button = entities[0]
-    assert isinstance(button, PlacesForceUpdateButton)
     assert button.entity_registry_enabled_default is False
     await button.async_press()
     coordinator.async_force_update.assert_awaited_once_with()

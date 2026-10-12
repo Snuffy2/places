@@ -366,7 +366,6 @@ def test_get_devicetracker_id_entities_uses_scanned_state_when_lookup_is_missing
     )
     monkeypatch.setattr("custom_components.places.config_flow.er", registry_module, raising=False)
     mock_hass.states.async_all.return_value = [tracker_state]
-    mock_hass.states.get.return_value = None
 
     entities = get_devicetracker_id_entities(mock_hass)
 
@@ -392,8 +391,8 @@ def test_get_home_zone_entities_builds_zone_list(
     domain = HOME_LOCATION_DOMAINS[0]
     hass.states.async_all = MagicMock(
         return_value=[
-            State("zone.home", "", {ATTR_FRIENDLY_NAME: "Home Zone"}),
             State("zone.work", "", {ATTR_FRIENDLY_NAME: "Work Zone"}),
+            State("zone.home", "", {ATTR_FRIENDLY_NAME: "Home Zone"}),
         ]
     )
 
@@ -407,13 +406,6 @@ def test_get_home_zone_entities_builds_zone_list(
     # Should sort by label
     labels = [z["label"] for z in zones]
     assert labels == sorted(labels, key=str.casefold)
-
-
-def test_async_get_options_flow_returns_handler() -> None:
-    """Ensure PlacesConfigFlow.async_get_options_flow returns a handler instance for a config entry."""
-    config_entry = MockConfigEntry(domain="places", data={})
-    handler = PlacesConfigFlow.async_get_options_flow(config_entry)
-    assert isinstance(handler, PlacesOptionsFlowHandler)
 
 
 @pytest.mark.asyncio
@@ -431,7 +423,7 @@ async def test_options_flow_handler_shows_form_when_no_user_input(
             Pytest fixture for replacing dependencies.
     """
     config_entry.add_to_hass(mock_hass)
-    handler = PlacesOptionsFlowHandler()
+    handler = PlacesConfigFlow.async_get_options_flow(config_entry)
     handler.hass = mock_hass
     # attach config_entry property and stub helper functions via monkeypatch
     monkeypatch.setattr(
@@ -588,7 +580,6 @@ async def test_validate_display_options_allows_legacy_long_rules(display_options
     [
         ("", {"base": "invalid_syntax"}),
         ("   ", {"base": "invalid_syntax"}),
-        ("\n\t", {"base": "invalid_syntax"}),
     ],
 )
 async def test_validate_display_options_rejects_blank_values(

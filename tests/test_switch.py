@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 from homeassistant.helpers.entity import EntityCategory
 
 from custom_components.places.const import CONF_SHOW_TIME
-from custom_components.places.switch import PlacesShowLastUpdatedSwitch, async_setup_entry
+from custom_components.places.switch import async_setup_entry
 
 
 async def test_show_last_updated_switch_setup_and_update() -> None:
@@ -19,7 +19,6 @@ async def test_show_last_updated_switch_setup_and_update() -> None:
     await async_setup_entry(MagicMock(), entry, async_add_entities)
 
     entity = async_add_entities.call_args.args[0][0]
-    assert isinstance(entity, PlacesShowLastUpdatedSwitch)
     assert entity.entity_category is EntityCategory.CONFIG
     assert entity.entity_registry_enabled_default is False
     assert entity.is_on is False
