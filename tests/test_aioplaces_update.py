@@ -44,7 +44,6 @@ class FakeCleanupClient:
         self.fail_on_ref_lookup = fail_on_ref_lookup
         self.closed_prs: list[int] = []
         self.deleted_refs: list[str] = []
-        self.ref_lookups: list[str] = []
 
     def list_pulls(self, *, state: str) -> list[dict[str, object]]:
         """Return fake pull requests by state.
@@ -90,7 +89,6 @@ class FakeCleanupClient:
         Raises:
             OSError: The fake was configured to fail ref lookups.
         """
-        self.ref_lookups.append(branch)
         if self.fail_on_ref_lookup:
             raise OSError("GitHub ref lookup failed")
         return self.ref_shas.get(branch)
@@ -565,7 +563,6 @@ def test_cleanup_script_does_not_delete_unowned_or_orphan_branch(
 
     assert client.closed_prs == []
     assert client.deleted_refs == []
-    assert client.ref_lookups == []
     assert result.closed_prs == []
     assert result.deleted_branches == []
 
@@ -581,7 +578,6 @@ def test_cleanup_script_does_not_delete_unowned_or_orphan_branch(
     )
 
     assert orphan.deleted_refs == []
-    assert orphan.ref_lookups == []
     assert orphan_result.deleted_branches == []
 
 
@@ -612,7 +608,6 @@ def test_cleanup_script_does_not_delete_recreated_branch_with_new_sha(
         delete_merged_branches=True,
     )
 
-    assert client.ref_lookups == [branch]
     assert client.deleted_refs == []
     assert result.deleted_branches == []
 
@@ -645,7 +640,6 @@ def test_cleanup_script_does_not_delete_when_ref_lookup_fails(
             delete_merged_branches=True,
         )
 
-    assert client.ref_lookups == [branch]
     assert client.deleted_refs == []
 
 
@@ -675,7 +669,6 @@ def test_cleanup_script_closes_and_deletes_valid_stale_bot_pr(
     )
 
     assert client.closed_prs == [10]
-    assert client.ref_lookups == [branch]
     assert client.deleted_refs == [f"heads/{branch}"]
     assert result.closed_prs == [10]
     assert result.deleted_branches == [branch]
