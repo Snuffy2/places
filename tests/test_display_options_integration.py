@@ -20,7 +20,7 @@ from custom_components.places.coordinator import PlacesUpdateCoordinator
 
 # Semantic location attributes used by the display-option cases below.
 BASE_INTERNAL_ATTR = {
-    "zone_name": "not_home",
+    "zone_name": "Named Zone",
     "zone": "not_home",
     "place_name": "Roy Spiegel MSW",
     "place_name_no_dupe": "Roy Spiegel MSW",
@@ -100,14 +100,15 @@ async def render_display_option(
 @pytest.mark.parametrize(
     ("display_option", "expected_state"),
     [
-        ("zone_name", "not_home"),
+        ("zone_name", "Named Zone"),
+        ("place", "Roy Spiegel MSW, house, Koreatown, 1, Bridge Plaza North"),
         (
             "zone, place",
             "not_home, Roy Spiegel MSW, house, Koreatown, 1, Bridge Plaza North",
         ),
         (
             "zone_name, place",
-            "not_home, Roy Spiegel MSW, house, Koreatown, 1, Bridge Plaza North",
+            "Named Zone, Roy Spiegel MSW, house, Koreatown, 1, Bridge Plaza North",
         ),
         ("formatted_place", "Roy Spiegel MSW, Fort Lee, NJ"),
         (
@@ -148,22 +149,3 @@ async def test_display_options_state_render(
     state = await render_display_option(mock_hass, monkeypatch, display_option)
 
     assert state == expected_state
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("patch_entity_registry")
-async def test_basic_place_option_includes_neighborhood(
-    mock_hass: MagicMock, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Basic place options should retain neighborhood context.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        monkeypatch (pytest.MonkeyPatch):
-            Pytest fixture for replacing dependencies.
-    """
-    basic_state = await render_display_option(mock_hass, monkeypatch, "place")
-
-    assert basic_state
-    assert "Koreatown" in basic_state

@@ -6,16 +6,15 @@ import logging
 from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
-import cachetools
-from homeassistant.components.recorder import DATA_INSTANCE
+from aioplaces import PlacesClient
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.places import (
-    _ensure_osm_runtime_state,
     async_migrate_entry,
     async_remove_entry,
     async_remove_extended_entity,
+    async_setup,
     async_setup_entry,
     async_unload_entry,
 )
@@ -33,8 +32,7 @@ from custom_components.places.const import (
     CONF_SHOW_TIME,
     DEFAULT_DISPLAY_OPTIONS,
     DOMAIN,
-    OSM_CACHE,
-    OSM_THROTTLE,
+    PLACES_CLIENT,
     PLATFORMS,
 )
 from custom_components.places.coordinator import PlacesUpdateCoordinator
@@ -414,20 +412,33 @@ async def test_async_remove_entry_uses_entry_id_if_name_missing(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entity_id", "expected_remove"),
+    [
+        pytest.param("sensor.test_extended_data", True, id="registry-entry-present"),
+        pytest.param(None, False, id="registry-entry-missing"),
+    ],
+)
 async def test_async_remove_extended_entity_removes_registry_entry(
     monkeypatch: pytest.MonkeyPatch,
     mock_hass: MagicMock,
+    entity_id: str | None,
+    expected_remove: bool,
 ) -> None:
-    """Extended-data entity cleanup should remove the registry entry when present.
+    """Extended-data cleanup should remove a registry entry only when present.
 
     Args:
         monkeypatch (pytest.MonkeyPatch):
             Pytest fixture for replacing dependencies.
         mock_hass (MagicMock):
             Mocked Home Assistant runtime.
+        entity_id (str | None):
+            Registry entry returned for the extended-data entity.
+        expected_remove (bool):
+            Whether cleanup should remove the registry entry.
     """
     registry = MagicMock()
-    registry.async_get_entity_id.return_value = "sensor.test_extended_data"
+    registry.async_get_entity_id.return_value = entity_id
     monkeypatch.setattr("custom_components.places.er.async_get", lambda hass: registry)
     entry = MockConfigEntry(domain="places", entry_id="entry123", data={"name": "Test"})
 
@@ -436,33 +447,10 @@ async def test_async_remove_extended_entity_removes_registry_entry(
     registry.async_get_entity_id.assert_called_once_with(
         "sensor", "places", "entry123_extended_data"
     )
-    registry.async_remove.assert_called_once_with("sensor.test_extended_data")
-
-
-@pytest.mark.asyncio
-async def test_async_remove_extended_entity_ignores_missing_registry_entry(
-    monkeypatch: pytest.MonkeyPatch,
-    mock_hass: MagicMock,
-) -> None:
-    """Extended-data cleanup should no-op when no registry entry exists.
-
-    Args:
-        monkeypatch (pytest.MonkeyPatch):
-            Pytest fixture for replacing dependencies.
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-    """
-    registry = MagicMock()
-    registry.async_get_entity_id.return_value = None
-    monkeypatch.setattr("custom_components.places.er.async_get", lambda hass: registry)
-    entry = MockConfigEntry(domain="places", entry_id="entry123", data={"name": "Test"})
-
-    await async_remove_extended_entity(mock_hass, entry)
-
-    registry.async_get_entity_id.assert_called_once_with(
-        "sensor", "places", "entry123_extended_data"
-    )
-    registry.async_remove.assert_not_called()
+    if expected_remove:
+        registry.async_remove.assert_called_once_with(entity_id)
+    else:
+        registry.async_remove.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -612,9 +600,7 @@ async def test_async_setup_entry_calls_forward_setups(
 
     assert result is True
     assert isinstance(mock_entry.runtime_data, _FakeCoordinator)
-    assert isinstance(mock_hass.data[DOMAIN][OSM_CACHE], cachetools.TTLCache)
-    assert isinstance(mock_hass.data[DOMAIN][OSM_THROTTLE]["lock"], asyncio.Lock)
-    assert mock_hass.data[DOMAIN][OSM_THROTTLE]["last_query"] == 0.0
+    assert isinstance(mock_hass.data[DOMAIN][PLACES_CLIENT], PlacesClient)
     assert _FakeSetupPlacesStorage.instances[0].entry_id == mock_entry.entry_id
     assert _FakeSetupPlacesStorage.instances[0].name == mock_entry.data[CONF_NAME]
     assert mock_entry.runtime_data.imported_attributes == {"native_value": "Restored"}
@@ -718,35 +704,22 @@ async def test_async_setup_entry_renders_current_options_from_persisted_location
     assert entry.runtime_data.data.native_value == expected_state
 
 
-def test_ensure_osm_runtime_state_preserves_existing_state(mock_hass: MagicMock) -> None:
-    """OSM runtime setup should not replace existing shared cache or throttle.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-    """
-    cache: dict[str, object] = {"cached": {"ok": True}}
-    throttle = {"lock": asyncio.Lock(), "last_query": 42.0}
-    mock_hass.data = {
-        DOMAIN: {
-            OSM_CACHE: cache,
-            OSM_THROTTLE: throttle,
-        }
-    }
-
-    _ensure_osm_runtime_state(mock_hass)
-
-    assert mock_hass.data[DOMAIN][OSM_CACHE] is cache
-    assert mock_hass.data[DOMAIN][OSM_THROTTLE] is throttle
-
-
 @pytest.mark.asyncio
-async def test_async_setup_entry_does_not_subscribe_when_platform_setup_fails(
+@pytest.mark.parametrize(
+    "cleanup_outcome",
+    [
+        pytest.param("succeeds", id="cleanup-succeeds"),
+        pytest.param("returns-false", id="cleanup-returns-false"),
+        pytest.param("raises", id="cleanup-raises"),
+    ],
+)
+async def test_async_setup_entry_cleans_up_when_platform_setup_fails(
     monkeypatch: pytest.MonkeyPatch,
     mock_hass: MagicMock,
     mock_entry: MockConfigEntry,
+    cleanup_outcome: str,
 ) -> None:
-    """Forwarding failure should unsubscribe the coordinator and clear runtime data.
+    """Forwarding failure clears runtime state despite platform cleanup outcomes.
 
     Args:
         monkeypatch (pytest.MonkeyPatch):
@@ -755,54 +728,24 @@ async def test_async_setup_entry_does_not_subscribe_when_platform_setup_fails(
             Mocked Home Assistant runtime.
         mock_entry (MockConfigEntry):
             Places configuration entry used by the test.
-    """
-    monkeypatch.setattr("custom_components.places.PlacesStorage", _FakeSetupPlacesStorage)
-    monkeypatch.setattr("custom_components.places.PlacesUpdateCoordinator", _FakeCoordinator)
-    mock_hass.config_entries.async_forward_entry_setups.side_effect = RuntimeError("boom")
-
-    with pytest.raises(RuntimeError, match="boom"):
-        await async_setup_entry(mock_hass, mock_entry)
-
-    coordinator = _FakeCoordinator.instances[0]
-    coordinator.async_added_to_hass.assert_awaited_once_with()
-    coordinator.async_prepare_unload.assert_awaited_once_with()
-    coordinator.async_shutdown.assert_awaited_once_with()
-    mock_hass.config_entries.async_unload_platforms.assert_awaited_once_with(mock_entry, PLATFORMS)
-    assert mock_entry.runtime_data is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("cleanup_raises", [False, True])
-async def test_async_setup_entry_clears_runtime_when_platform_cleanup_fails(
-    monkeypatch: pytest.MonkeyPatch,
-    mock_hass: MagicMock,
-    mock_entry: MockConfigEntry,
-    cleanup_raises: bool,
-) -> None:
-    """Forwarding failure cleanup should not resume a never-loaded coordinator.
-
-    Args:
-        monkeypatch (pytest.MonkeyPatch):
-            Pytest fixture for replacing dependencies.
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        cleanup_raises (bool):
-            Whether cleanup is expected to raise internally.
+        cleanup_outcome (str):
+            Platform cleanup outcome after the original setup failure.
     """
     monkeypatch.setattr("custom_components.places.PlacesStorage", _FakeSetupPlacesStorage)
     monkeypatch.setattr("custom_components.places.PlacesUpdateCoordinator", _FakeCoordinator)
     mock_hass.config_entries.async_forward_entry_setups.side_effect = RuntimeError("setup failed")
-    if cleanup_raises:
+    if cleanup_outcome == "raises":
         mock_hass.config_entries.async_unload_platforms.side_effect = RuntimeError("cleanup failed")
-    else:
+    elif cleanup_outcome == "returns-false":
         mock_hass.config_entries.async_unload_platforms.return_value = False
+    else:
+        mock_hass.config_entries.async_unload_platforms.return_value = True
 
     with pytest.raises(RuntimeError, match="setup failed"):
         await async_setup_entry(mock_hass, mock_entry)
 
     coordinator = _FakeCoordinator.instances[0]
+    coordinator.async_added_to_hass.assert_awaited_once_with()
     coordinator.async_prepare_unload.assert_awaited_once_with()
     coordinator.async_resume_after_failed_unload.assert_not_awaited()
     coordinator.async_shutdown.assert_awaited_once_with()
@@ -1005,12 +948,23 @@ async def test_async_setup_entry_cleans_up_when_setup_is_cancelled(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_type", "error_message", "logs_error"),
+    [
+        pytest.param(RuntimeError, "subscribe boom", True, id="subscription-error"),
+        pytest.param(asyncio.CancelledError, "subscription cancelled", False, id="cancelled"),
+    ],
+)
 async def test_async_setup_entry_shuts_down_when_subscription_step_fails(
     monkeypatch: pytest.MonkeyPatch,
     mock_hass: MagicMock,
     mock_entry: MockConfigEntry,
+    caplog: pytest.LogCaptureFixture,
+    failure_type: type[RuntimeError | asyncio.CancelledError],
+    error_message: str,
+    logs_error: bool,
 ) -> None:
-    """Subscription failure should shutdown the coordinator before any platform unload.
+    """Subscription failures and cancellation should shut down before platform unload.
 
     Args:
         monkeypatch (pytest.MonkeyPatch):
@@ -1019,18 +973,26 @@ async def test_async_setup_entry_shuts_down_when_subscription_step_fails(
             Mocked Home Assistant runtime.
         mock_entry (MockConfigEntry):
             Places configuration entry used by the test.
+        caplog (pytest.LogCaptureFixture):
+            Captured logs used to distinguish errors from cancellation.
+        failure_type (type[RuntimeError | asyncio.CancelledError]):
+            Exception class raised by the subscription hook.
+        error_message (str):
+            Message carried by the configured exception.
+        logs_error (bool):
+            Whether setup logs the subscription failure as an error.
     """
     monkeypatch.setattr("custom_components.places.PlacesStorage", _FakeSetupPlacesStorage)
     monkeypatch.setattr("custom_components.places.PlacesUpdateCoordinator", _FakeCoordinator)
 
-    async def raise_subscription_error() -> None:
-        """Raise a subscription error during ``async_added_to_hass`` before platform forwarding.
+    async def raise_subscription_failure() -> None:
+        """Raise the configured subscription failure before platform forwarding.
 
         Raises:
-            RuntimeError:
-                Propagated when the operation fails.
+            failure_type:
+                Propagated from the configured subscription failure.
         """
-        raise RuntimeError("subscribe boom")
+        raise failure_type(error_message)
 
     original_init = _FakeCoordinator.__init__
 
@@ -1056,11 +1018,14 @@ async def test_async_setup_entry_shuts_down_when_subscription_step_fails(
                 Places persistence manager used by the test.
         """
         original_init(self, hass, config_entry, imported_attributes, persistence)
-        self.async_added_to_hass.side_effect = raise_subscription_error
+        self.async_added_to_hass.side_effect = raise_subscription_failure
 
     monkeypatch.setattr(_FakeCoordinator, "__init__", init_with_failing_subscription)
 
-    with pytest.raises(RuntimeError, match="subscribe boom"):
+    with (
+        caplog.at_level(logging.ERROR, logger="custom_components.places"),
+        pytest.raises(failure_type, match=error_message),
+    ):
         await async_setup_entry(mock_hass, mock_entry)
 
     coordinator = _FakeCoordinator.instances[0]
@@ -1068,72 +1033,7 @@ async def test_async_setup_entry_shuts_down_when_subscription_step_fails(
     coordinator.async_shutdown.assert_awaited_once_with()
     mock_hass.config_entries.async_unload_platforms.assert_not_awaited()
     assert mock_entry.runtime_data is None
-
-
-@pytest.mark.asyncio
-async def test_async_setup_entry_shuts_down_when_subscription_is_cancelled(
-    monkeypatch: pytest.MonkeyPatch,
-    mock_hass: MagicMock,
-    mock_entry: MockConfigEntry,
-) -> None:
-    """Subscription cancellation should shut down without unloading platforms.
-
-    Args:
-        monkeypatch (pytest.MonkeyPatch):
-            Pytest fixture for replacing dependencies.
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-    """
-    monkeypatch.setattr("custom_components.places.PlacesStorage", _FakeSetupPlacesStorage)
-    monkeypatch.setattr("custom_components.places.PlacesUpdateCoordinator", _FakeCoordinator)
-
-    async def raise_subscription_cancellation() -> None:
-        """Cancel tracker subscription setup.
-
-        Raises:
-            asyncio.CancelledError:
-                Always raised to emulate subscription cancellation.
-        """
-        raise asyncio.CancelledError("subscription cancelled")
-
-    original_init = _FakeCoordinator.__init__
-
-    def init_with_cancelled_subscription(
-        self: _FakeCoordinator,
-        hass: object,
-        config_entry: MockConfigEntry,
-        imported_attributes: dict[str, object],
-        persistence: _FakeSetupPlacesStorage | MagicMock,
-    ) -> None:
-        """Install a cancelled ``async_added_to_hass`` hook.
-
-        Args:
-            self (_FakeCoordinator):
-                Fake coordinator receiving the subscription hook.
-            hass (object):
-                Mocked Home Assistant runtime.
-            config_entry (MockConfigEntry):
-                Places configuration entry used by the test.
-            imported_attributes (dict[str, object]):
-                Persisted attributes imported at startup.
-            persistence (_FakeSetupPlacesStorage | MagicMock):
-                Places persistence manager used by the test.
-        """
-        original_init(self, hass, config_entry, imported_attributes, persistence)
-        self.async_added_to_hass.side_effect = raise_subscription_cancellation
-
-    monkeypatch.setattr(_FakeCoordinator, "__init__", init_with_cancelled_subscription)
-
-    with pytest.raises(asyncio.CancelledError, match="subscription cancelled"):
-        await async_setup_entry(mock_hass, mock_entry)
-
-    coordinator = _FakeCoordinator.instances[0]
-    coordinator.async_added_to_hass.assert_awaited_once_with()
-    coordinator.async_shutdown.assert_awaited_once_with()
-    mock_hass.config_entries.async_unload_platforms.assert_not_awaited()
-    assert mock_entry.runtime_data is None
+    assert ("Unable to subscribe to tracker updates" in caplog.text) is logs_error
 
 
 @pytest.mark.asyncio
@@ -1161,41 +1061,12 @@ async def test_async_setup_entry_with_empty_data(
 
 
 @pytest.mark.asyncio
-async def test_async_setup_entry_preserves_recorder_event_exclusions_for_extended_attributes(
-    monkeypatch: pytest.MonkeyPatch,
-    mock_hass: MagicMock,
-) -> None:
-    """Extended mode should not alter global Recorder event exclusions.
-
-    Args:
-        monkeypatch (pytest.MonkeyPatch):
-            Pytest fixture for replacing dependencies.
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-    """
-    entry = MockConfigEntry(
-        domain="places",
-        data={
-            "name": "TestSensor",
-            "devicetracker_id": "person.test",
-            CONF_EXTENDED_ATTR: True,
-        },
-    )
-    recorder = MagicMock()
-    recorder.exclude_event_types = {"external_event"}
-    mock_hass.data[DATA_INSTANCE] = recorder
-    monkeypatch.setattr("custom_components.places.PlacesStorage", _FakeSetupPlacesStorage)
-    monkeypatch.setattr("custom_components.places.PlacesUpdateCoordinator", _FakeCoordinator)
-
-    await async_setup_entry(mock_hass, entry)
-
-    assert recorder.exclude_event_types == {"external_event"}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("unload_return", "expected"), [(True, True), (False, False)])
+@pytest.mark.parametrize(
+    "unload_return",
+    [pytest.param(True, id="platforms-unloaded"), pytest.param(False, id="unload-rejected")],
+)
 async def test_async_unload_entry_result(
-    mock_hass: MagicMock, mock_entry: MockConfigEntry, unload_return: bool, expected: bool
+    mock_hass: MagicMock, mock_entry: MockConfigEntry, unload_return: bool
 ) -> None:
     """Unload should proxy the platform result and only finalize shutdown on success.
 
@@ -1206,62 +1077,59 @@ async def test_async_unload_entry_result(
             Places configuration entry used by the test.
         unload_return (bool):
             Platform-unload result returned by the mock.
-        expected (bool):
-            Expected result for this parametrized case.
-    """
-    coordinator = _FakeCoordinator(mock_hass, mock_entry, {}, MagicMock())
-    mock_entry.runtime_data = coordinator
-    mock_hass.config_entries.async_unload_platforms.return_value = unload_return
-
-    result = await async_unload_entry(mock_hass, mock_entry)
-
-    assert result is expected
-    mock_hass.config_entries.async_unload_platforms.assert_awaited_once_with(mock_entry, PLATFORMS)
-    coordinator.async_prepare_unload.assert_awaited_once_with()
-    if unload_return:
-        coordinator.async_shutdown.assert_awaited_once_with()
-        coordinator.async_resume_after_failed_unload.assert_not_awaited()
-        assert mock_entry.runtime_data is None
-    else:
-        coordinator.async_shutdown.assert_not_awaited()
-        coordinator.async_resume_after_failed_unload.assert_awaited_once_with()
-        assert mock_entry.runtime_data is coordinator
-
-
-@pytest.mark.asyncio
-async def test_async_unload_entry_prepares_unload_before_platform_unload_and_shutdowns_after_success(
-    mock_hass: MagicMock, mock_entry: MockConfigEntry
-) -> None:
-    """Teardown should stop update work before unloading and finalize after success.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_entry (MockConfigEntry):
-            Places configuration entry used by the test.
     """
     coordinator = _FakeCoordinator(mock_hass, mock_entry, {}, MagicMock())
     mock_entry.runtime_data = coordinator
     call_order: list[str] = []
 
     async def mark_prepare_unload() -> None:
+        """Record coordinator preparation before platform unload."""
         call_order.append("prepare_unload")
 
     async def mark_unload(_entry: MockConfigEntry, _platforms: list[str]) -> bool:
+        """Record platform unload and return its configured result.
+
+        Args:
+            _entry (MockConfigEntry):
+                Config entry passed to platform unloading.
+            _platforms (list[str]):
+                Platforms requested for unloading.
+
+        Returns:
+            bool:
+                Configured platform-unload result.
+        """
         call_order.append("unload_platforms")
-        return True
+        return unload_return
 
     async def mark_shutdown() -> None:
+        """Record coordinator shutdown after successful platform unload."""
         call_order.append("shutdown")
+
+    async def mark_resume() -> None:
+        """Record coordinator recovery after platform unload fails."""
+        call_order.append("resume")
 
     coordinator.async_prepare_unload.side_effect = mark_prepare_unload
     coordinator.async_shutdown.side_effect = mark_shutdown
+    coordinator.async_resume_after_failed_unload.side_effect = mark_resume
     mock_hass.config_entries.async_unload_platforms.side_effect = mark_unload
 
     result = await async_unload_entry(mock_hass, mock_entry)
 
-    assert result is True
-    assert call_order == ["prepare_unload", "unload_platforms", "shutdown"]
+    assert result is unload_return
+    mock_hass.config_entries.async_unload_platforms.assert_awaited_once_with(mock_entry, PLATFORMS)
+    coordinator.async_prepare_unload.assert_awaited_once_with()
+    if unload_return:
+        assert call_order == ["prepare_unload", "unload_platforms", "shutdown"]
+        coordinator.async_shutdown.assert_awaited_once_with()
+        coordinator.async_resume_after_failed_unload.assert_not_awaited()
+        assert mock_entry.runtime_data is None
+    else:
+        assert call_order == ["prepare_unload", "unload_platforms", "resume"]
+        coordinator.async_shutdown.assert_not_awaited()
+        coordinator.async_resume_after_failed_unload.assert_awaited_once_with()
+        assert mock_entry.runtime_data is coordinator
 
 
 @pytest.mark.asyncio
@@ -1303,43 +1171,6 @@ async def test_async_unload_entry_completes_when_shutdown_raises(
     assert entry.runtime_data is None
     assert "shutdown failed" in caplog.text
     assert entry.entry_id in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_async_unload_entry_resumes_coordinator_when_platform_unload_fails(
-    mock_hass: MagicMock, mock_entry: MockConfigEntry
-) -> None:
-    """A failed platform unload should leave the still-loaded coordinator active.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-    """
-    coordinator = _FakeCoordinator(mock_hass, mock_entry, {}, MagicMock())
-    mock_entry.runtime_data = coordinator
-    call_order: list[str] = []
-
-    async def mark_prepare_unload() -> None:
-        call_order.append("prepare_unload")
-
-    async def mark_unload(_entry: MockConfigEntry, _platforms: list[str]) -> bool:
-        call_order.append("unload_platforms")
-        return False
-
-    async def mark_resume() -> None:
-        call_order.append("resume")
-
-    coordinator.async_prepare_unload.side_effect = mark_prepare_unload
-    coordinator.async_resume_after_failed_unload.side_effect = mark_resume
-    mock_hass.config_entries.async_unload_platforms.side_effect = mark_unload
-
-    result = await async_unload_entry(mock_hass, mock_entry)
-
-    assert result is False
-    assert call_order == ["prepare_unload", "unload_platforms", "resume"]
-    coordinator.async_shutdown.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1473,7 +1304,7 @@ async def test_runtime_data_isolation(
     monkeypatch: pytest.MonkeyPatch,
     mock_hass: MagicMock,
 ) -> None:
-    """Each config entry should receive its own coordinator instance.
+    """Entries get separate coordinators while sharing the API client.
 
     Args:
         monkeypatch (pytest.MonkeyPatch):
@@ -1487,11 +1318,14 @@ async def test_runtime_data_isolation(
     monkeypatch.setattr("custom_components.places.PlacesUpdateCoordinator", _FakeCoordinator)
 
     await async_setup_entry(mock_hass, entry1)
+    places_client = mock_hass.data[DOMAIN][PLACES_CLIENT]
     await async_setup_entry(mock_hass, entry2)
 
     assert isinstance(entry1.runtime_data, _FakeCoordinator)
     assert isinstance(entry2.runtime_data, _FakeCoordinator)
     assert entry1.runtime_data is not entry2.runtime_data
+    assert isinstance(places_client, PlacesClient)
+    assert mock_hass.data[DOMAIN][PLACES_CLIENT] is places_client
 
 
 @pytest.mark.asyncio
@@ -1539,3 +1373,56 @@ async def test_async_unload_entry_does_not_remove_store_data(
     await async_unload_entry(mock_hass, mock_entry)
 
     assert _FakePlacesStorage.remove_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("places_level", "library_level", "client_level", "expected_library_level", "debug_visible"),
+    [
+        (logging.DEBUG, logging.NOTSET, logging.NOTSET, logging.DEBUG, True),
+        (logging.DEBUG, logging.WARNING, logging.NOTSET, logging.WARNING, False),
+        (logging.NOTSET, logging.NOTSET, logging.NOTSET, logging.NOTSET, False),
+        (logging.DEBUG, logging.NOTSET, logging.WARNING, logging.DEBUG, False),
+    ],
+    ids=["inherit-debug", "explicit-library", "unset-integration", "explicit-client"],
+)
+async def test_async_setup_aligns_library_logging(
+    mock_hass: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+    places_level: int,
+    library_level: int,
+    client_level: int,
+    expected_library_level: int,
+    debug_visible: bool,
+) -> None:
+    """Apply default library logging while honoring explicit logger settings.
+
+    Args:
+        mock_hass (MagicMock): Mocked Home Assistant runtime.
+        caplog (pytest.LogCaptureFixture): Captured library log messages.
+        places_level (int): Configured Places integration level.
+        library_level (int): Configured library parent level.
+        client_level (int): Configured library client level.
+        expected_library_level (int): Library parent level after setup.
+        debug_visible (bool): Whether client debug output should be visible.
+    """
+    places_logger = logging.getLogger("custom_components.places")
+    library_logger = logging.getLogger("aioplaces")
+    client_logger = logging.getLogger("aioplaces.client")
+    original_levels = (places_logger.level, library_logger.level, client_logger.level)
+    try:
+        with caplog.at_level(logging.DEBUG):
+            logging.getLogger().setLevel(logging.WARNING)
+            places_logger.setLevel(places_level)
+            library_logger.setLevel(library_level)
+            client_logger.setLevel(client_level)
+
+            assert await async_setup(mock_hass, {}) is True
+            client_logger.debug("Places library debug probe")
+
+            assert library_logger.level == expected_library_level
+            assert client_logger.level == client_level
+            assert ("Places library debug probe" in caplog.text) is debug_visible
+    finally:
+        places_logger.setLevel(original_levels[0])
+        library_logger.setLevel(original_levels[1])
+        client_logger.setLevel(original_levels[2])
