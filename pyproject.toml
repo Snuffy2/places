@@ -5,8 +5,7 @@ description = "Places Home Assistant integration"
 readme = "README.md"
 requires-python = ">=3.14.2"
 dependencies = [
-  "aiohttp",
-  "cachetools",
+  "aioplaces==0.1.1",
 ]
 
 [tool.setuptools.dynamic]
@@ -25,7 +24,6 @@ lint = [
   "mypy",
   "prek",
   "ruff",
-  "types-cachetools",
   "types-cffi",
   "types-greenlet",
   "types-PyMySQL",

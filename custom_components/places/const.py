@@ -36,8 +36,7 @@ DEFAULT_SHOW_TIME = False
 DEFAULT_DATE_FORMAT = "mm/dd"
 DEFAULT_USE_GPS = True
 
-OSM_CACHE = "osm_cache"
-OSM_THROTTLE = "osm_throttle"
+PLACES_CLIENT = "places_client"
 OSM_CACHE_MAX_AGE_HOURS = 4
 OSM_CACHE_MAX_SIZE = 500
 OSM_THROTTLE_INTERVAL_SECONDS = 1.0
@@ -345,38 +344,3 @@ DISPLAY_OPTIONS_MAP: MutableMapping[str, str] = {
     "zone": ATTR_DEVICETRACKER_ZONE,
     "zone_name": ATTR_DEVICETRACKER_ZONE_NAME,
 }
-
-# Place type classification lists
-# Note: These lists have intentional overlaps. The parsing order in parse_osm.py is:
-# 1. CITY_LIST (highest priority)
-# 2. POSTAL_TOWN_LIST (items already matched in CITY_LIST are skipped)
-# 3. NEIGHBOURHOOD_LIST (items already matched in previous lists are skipped)
-CITY_LIST = [
-    "city",
-    "town",
-    "village",
-    "township",
-    "hamlet",
-    "city_district",
-    "municipality",
-]
-
-POSTAL_TOWN_LIST = [
-    "city",
-    "town",
-    "village",
-    "township",
-    "hamlet",
-    "borough",
-    "suburb",
-]
-
-NEIGHBOURHOOD_LIST = [
-    "village",
-    "township",
-    "hamlet",
-    "borough",
-    "suburb",
-    "quarter",
-    "neighbourhood",
-]

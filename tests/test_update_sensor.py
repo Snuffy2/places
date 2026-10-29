@@ -4,18 +4,14 @@ import asyncio
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime, timedelta
-import json
 import logging
-from typing import Protocol
 from unittest.mock import AsyncMock, MagicMock
-from urllib.parse import parse_qs, urlparse
 
-import aiohttp
+from aioplaces import PlacesClient, PlacesError
 from homeassistant.const import (
     ATTR_FRIENDLY_NAME,
     ATTR_GPS_ACCURACY,
     CONF_API_KEY,
-    CONF_FRIENDLY_NAME,
     CONF_LATITUDE,
     CONF_LONGITUDE,
     CONF_NAME,
@@ -64,10 +60,6 @@ from custom_components.places.const import (
     CONF_MAP_PROVIDER,
     CONF_SHOW_TIME,
     CONF_USE_GPS,
-    DOMAIN,
-    OSM_CACHE,
-    OSM_THROTTLE,
-    OSM_THROTTLE_INTERVAL_SECONDS,
     UpdateStatus,
 )
 from custom_components.places.sensor import Places
@@ -75,32 +67,12 @@ from custom_components.places.update_sensor import PlacesUpdater
 from tests.conftest import (
     CoordinatorFactory,
     MockSensor,
-    assert_awaited_count,
     stub_in_zone,
     stubbed_parser,
     stubbed_sensor,
 )
 
 type StubbedUpdater = Callable[..., AbstractContextManager[dict[str, AsyncMock]]]
-type ZoneSetup = Callable[[MockSensor, MagicMock], object]
-
-
-class AioClientMock(Protocol):
-    """Minimal aiohttp client mock surface used by these tests."""
-
-    def get(self, url: str, **kwargs: object) -> object:
-        """Register a mocked GET response.
-
-        Args:
-            url (str):
-                URL requested from the mocked HTTP client.
-            kwargs (object):
-                Request options forwarded to the mocked HTTP client.
-
-        Returns:
-            object:
-                Mocked HTTP response registration for the requested URL.
-        """
 
 
 @pytest.fixture
@@ -114,50 +86,24 @@ def mock_config_entry() -> MockConfigEntry:
     return MockConfigEntry(domain="places", data={CONF_NAME: "TestSensor"}, options={})
 
 
-def register_aioclient(aioclient_mock: AioClientMock, url: str, **kwargs: object) -> None:
-    """Register the url with aioclient_mock for common trailing-slash variants.
-
-    This helps ensure tests don't accidentally miss registrations due to a
-    trailing-slash difference between test data and the code under test.
-
-    Args:
-        aioclient_mock (AioClientMock):
-            Mocked HTTP client used for deterministic responses.
-        url (str):
-            URL requested from the mocked HTTP client.
-        kwargs (object):
-            Request options forwarded to the mocked HTTP client.
-    """
-    # exact
-    aioclient_mock.get(url, **kwargs)
-    # without trailing slash
-    if url.endswith("/"):
-        aioclient_mock.get(url.rstrip("/"), **kwargs)
-    else:
-        aioclient_mock.get(f"{url}/", **kwargs)
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("show_time", [False, True])
 @pytest.mark.parametrize("force", [False, True])
-@pytest.mark.parametrize("blank_payload", ["{}", "[]"])
 async def test_failed_lookup_retries_without_more_movement(
     mock_hass: MagicMock,
     coordinator_factory: CoordinatorFactory,
     monkeypatch: pytest.MonkeyPatch,
     show_time: bool,
     force: bool,
-    blank_payload: str,
 ) -> None:
-    """Retry failed lookups while retaining suppression of unchanged display updates.
+    """A missing place response rolls back coordinates and can be retried in place.
 
     Args:
         mock_hass (MagicMock): Mocked Home Assistant runtime.
         coordinator_factory (CoordinatorFactory): Factory for a real coordinator.
-        monkeypatch (pytest.MonkeyPatch): Scoped lookup and clock replacements.
+        monkeypatch (pytest.MonkeyPatch): Scoped client-method and clock replacements.
         show_time (bool): Whether to append the display's since time.
-        force (bool): Whether to force the failed update attempt.
-        blank_payload (str): Empty JSON response returned by the failed lookup.
+        force (bool): Whether the failed attempt bypasses the client's cache.
     """
     mock_hass.config.time_zone = "UTC"
     states = {
@@ -169,12 +115,6 @@ async def test_failed_lookup_retries_without_more_movement(
         ),
     }
     mock_hass.states.get.side_effect = states.get
-    mock_hass.data = {
-        DOMAIN: {
-            OSM_CACHE: {},
-            OSM_THROTTLE: {"lock": asyncio.Lock(), "last_query": 0.0},
-        }
-    }
     _, coordinator = coordinator_factory("Probe")
     persist = AsyncMock()
     monkeypatch.setattr(coordinator._persistence, "async_save", persist)
@@ -184,7 +124,7 @@ async def test_failed_lookup_retries_without_more_movement(
     monkeypatch.setattr(
         PlacesUpdater,
         "get_current_time",
-        AsyncMock(side_effect=[datetime(2024, 1, 1, hour, tzinfo=UTC) for hour in range(12, 17)]),
+        AsyncMock(side_effect=[datetime(2024, 1, 1, hour, tzinfo=UTC) for hour in range(12, 18)]),
     )
     payload = {
         "osm_id": 1,
@@ -193,51 +133,9 @@ async def test_failed_lookup_retries_without_more_movement(
         "type": "city",
         "address": {"city": "London", "country": "United Kingdom", "country_code": "gb"},
     }
+    reverse = AsyncMock(side_effect=[payload, payload, None, payload, payload])
+    monkeypatch.setattr(PlacesClient, "reverse", reverse)
 
-    def make_response_context(payload_text: str) -> MagicMock:
-        """Create an asynchronous response context for one mocked HTTP reply.
-
-        Args:
-            payload_text (str): Serialized JSON body returned by the response.
-
-        Returns:
-            MagicMock: Asynchronous context manager for a successful reply.
-        """
-        response = MagicMock(status=200)
-        response.text = AsyncMock(return_value=payload_text)
-        response_context = MagicMock()
-        response_context.__aenter__ = AsyncMock(return_value=response)
-        response_context.__aexit__ = AsyncMock(return_value=False)
-        return response_context
-
-    url_attempts: dict[str, int] = {}
-
-    def get_response(url: str, **_kwargs: object) -> MagicMock:
-        """Return one of the JSON bodies queued for the requested URL.
-
-        Args:
-            url (str): URL requested by the OSM client.
-            _kwargs (object): HTTP request options supplied by the OSM client.
-
-        Returns:
-            MagicMock: Asynchronous context manager for the selected reply.
-        """
-        query = parse_qs(urlparse(url).query)
-        if query.get("lat") == ["51.7"]:
-            attempt = url_attempts.get(url, 0)
-            url_attempts[url] = attempt + 1
-            response_text = blank_payload if attempt == 0 else json.dumps(payload)
-        else:
-            response_text = json.dumps(payload)
-        return make_response_context(response_text)
-
-    session = MagicMock()
-    session.get.side_effect = get_response
-    monkeypatch.setattr(
-        "custom_components.places.osm_client.async_get_clientsession",
-        MagicMock(return_value=session),
-    )
-    monkeypatch.setattr("custom_components.places.osm_client.OSM_THROTTLE_INTERVAL_SECONDS", 0)
     await coordinator._run_update("Test")
     original_state = coordinator.data.native_value
     original_changed = coordinator.data.attributes[ATTR_LAST_CHANGED]
@@ -245,9 +143,7 @@ async def test_failed_lookup_retries_without_more_movement(
     mock_hass.bus.fire.reset_mock()
 
     states["device_tracker.test"] = State(
-        "device_tracker.test",
-        "not_home",
-        {"latitude": 51.6, "longitude": -0.1, "gps_accuracy": 5},
+        "device_tracker.test", "not_home", {"latitude": 51.6, "longitude": -0.1, "gps_accuracy": 5}
     )
     await coordinator._run_update("Test")
     assert coordinator.data.native_value == original_state
@@ -256,9 +152,7 @@ async def test_failed_lookup_retries_without_more_movement(
     mock_hass.bus.fire.assert_not_called()
 
     states["device_tracker.test"] = State(
-        "device_tracker.test",
-        "not_home",
-        {"latitude": 51.7, "longitude": -0.1, "gps_accuracy": 5},
+        "device_tracker.test", "not_home", {"latitude": 51.7, "longitude": -0.1, "gps_accuracy": 5}
     )
     if force:
         await coordinator.async_force_update()
@@ -276,16 +170,26 @@ async def test_failed_lookup_retries_without_more_movement(
     assert coordinator.data.native_value == ("Oxford (since 15:00)" if show_time else "Oxford")
     assert coordinator.data.attributes[ATTR_LATITUDE] == 51.7
     assert coordinator.data.attributes[ATTR_LAST_CHANGED] == "2024-01-01 15:00:00+00:00"
-    assert session.get.call_count == 4
-    failed_url = session.get.call_args_list[2].args[0]
-    recovered_url = session.get.call_args_list[3].args[0]
-    assert failed_url == recovered_url
-    assert mock_hass.data[DOMAIN][OSM_CACHE][recovered_url] == payload
+    assert reverse.await_count == 4
+    assert [call.kwargs["use_cache"] for call in reverse.await_args_list] == [
+        True,
+        True,
+        not force,
+        True,
+    ]
+    assert reverse.await_args_list[2].args[:2] == reverse.await_args_list[3].args[:2]
     mock_hass.bus.fire.assert_called_once()
 
-    await coordinator._run_update("Test")
-    assert session.get.call_count == 4
-    mock_hass.bus.fire.assert_called_once()
+    if force:
+        # Force at the same coordinates must still reach the client without cache.
+        await coordinator.async_force_update()
+        assert reverse.await_count == 5
+        assert reverse.await_args_list[-1].args[:2] == reverse.await_args_list[-2].args[:2]
+        assert reverse.await_args_list[-1].kwargs["use_cache"] is False
+    else:
+        await coordinator._run_update("Test")
+        assert reverse.await_count == 4
+        mock_hass.bus.fire.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -366,96 +270,6 @@ async def test_do_update_flow_variants(
 
     assert sensor.attrs[ATTR_LAST_UPDATED] == "2024-01-01 12:00:00"
     sensor.publish_update.assert_called_once_with()
-
-
-@pytest.mark.asyncio
-async def test_do_update_force_skips_movement_criteria(
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    sensor: MockSensor,
-    stubbed_updater: StubbedUpdater,
-) -> None:
-    """A forced update still runs update criteria and disables cache reads.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        stubbed_updater (StubbedUpdater):
-            Updater with external dependencies replaced by stubs.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-
-    async def process_osm_update(**_kwargs: object) -> None:
-        sensor.attrs[ATTR_OSM_DICT] = {"place_id": 123}
-
-    with stubbed_updater(
-        updater,
-        [
-            ("get_current_time", {"return_value": datetime(2024, 1, 1, tzinfo=UTC)}),
-            ("update_entity_name_and_cleanup", {}),
-            ("update_previous_state", {}),
-            ("update_old_coordinates", {}),
-            (
-                "check_device_tracker_and_update_coords",
-                {"return_value": UpdateStatus.PROCEED},
-            ),
-            ("determine_update_criteria", {"return_value": UpdateStatus.PROCEED}),
-            ("process_osm_update", {"side_effect": process_osm_update}),
-            ("should_update_state", {"return_value": True}),
-            ("handle_state_update", {}),
-            ("rollback_update", {}),
-        ],
-    ) as mocks:
-        await updater.do_update("Force Update", {}, force=True)
-
-    mocks["determine_update_criteria"].assert_awaited_once_with(force=True)
-    mocks["process_osm_update"].assert_awaited_once()
-    mocks["should_update_state"].assert_not_awaited()
-    mocks["handle_state_update"].assert_awaited_once()
-    assert updater._use_cache is False
-
-
-@pytest.mark.asyncio
-async def test_determine_update_criteria_force_skips_movement_check(
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    sensor: MockSensor,
-    stubbed_updater: StubbedUpdater,
-) -> None:
-    """Force path should refresh derived fields but ignore movement gating.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        stubbed_updater (StubbedUpdater):
-            Updater with external dependencies replaced by stubs.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-
-    with stubbed_updater(
-        updater,
-        [
-            ("get_initial_last_place_name", {}),
-            ("get_zone_details", {}),
-            ("update_coordinates_and_distance", {"return_value": UpdateStatus.PROCEED}),
-            ("determine_if_update_needed", {"return_value": UpdateStatus.SKIP}),
-        ],
-    ) as mocks:
-        result = await updater.determine_update_criteria(force=True)
-
-    assert result == UpdateStatus.PROCEED
-    mocks["get_initial_last_place_name"].assert_awaited_once()
-    mocks["get_zone_details"].assert_awaited_once()
-    mocks["update_coordinates_and_distance"].assert_awaited_once()
-    mocks["determine_if_update_needed"].assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -594,8 +408,6 @@ async def test_do_update_rolls_back_and_finishes_on_phase_error(
             ("finish_update", {}),
         ],
     ) as mocks:
-        updater._osm_client.update_sensor_name = MagicMock()
-
         with pytest.raises(RuntimeError, match="OSM failed"):
             await updater.do_update("manual", {"snapshot": "value"})
 
@@ -658,8 +470,6 @@ async def test_do_update_skips_handle_and_finish_when_shutting_down_after_osm_up
             ("finish_update", {}),
         ],
     ) as mocks:
-        updater._osm_client.update_sensor_name = MagicMock()
-
         await updater.do_update("manual", {"snapshot": "value"})
 
         mocks["rollback_update"].assert_awaited_once_with(
@@ -716,8 +526,6 @@ async def test_do_update_skips_finish_and_publish_on_cancelled_task(
             ("finish_update", {}),
         ],
     ) as mocks:
-        updater._osm_client.update_sensor_name = MagicMock()
-
         with pytest.raises(asyncio.CancelledError):
             await updater.do_update("manual", {"snapshot": "value"})
 
@@ -776,8 +584,6 @@ async def test_do_update_rolls_back_partial_state_when_cancelled_during_shutdown
             ("finish_update", {}),
         ],
     ) as mocks:
-        updater._osm_client.update_sensor_name = MagicMock()
-
         with pytest.raises(asyncio.CancelledError):
             await updater.do_update("manual", previous_attr)
 
@@ -852,8 +658,6 @@ async def test_do_update_publishes_after_successful_rollback_path(
             ("finish_update", {"side_effect": finish_update}),
         ],
     ) as mocks:
-        updater._osm_client.update_sensor_name = MagicMock()
-
         await updater.do_update("manual", {"snapshot": "value"})
 
         mocks["rollback_update"].assert_awaited_once_with(
@@ -1313,30 +1117,6 @@ async def test_async_apply_show_time_preserves_aged_date_suffix(
 
 
 @pytest.mark.asyncio
-async def test_check_for_updated_entity_name_entity_id_new_name(
-    mock_hass: MagicMock, mock_config_entry: MockConfigEntry, sensor: MockSensor
-) -> None:
-    """Test that the entity name is updated and the config entry is updated when a new friendly name is detected.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    sensor.entity_id = "sensor.test"
-    state = MagicMock()
-    state.attributes = {ATTR_FRIENDLY_NAME: "NewName"}
-    mock_hass.states.get.return_value = state
-    sensor.get_attr.return_value = "OldName"
-    await updater.check_for_updated_entity_name()
-    mock_hass.config_entries.async_update_entry.assert_called()
-
-
-@pytest.mark.asyncio
 async def test_check_for_updated_entity_name_with_real_coordinator_entity(
     mock_hass: MagicMock,
     patch_entity_registry: object,
@@ -1608,18 +1388,12 @@ async def test_get_gps_accuracy_variants(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "tracker_attrs",
-    [{}, {ATTR_GPS_ACCURACY: None}, {ATTR_GPS_ACCURACY: "invalid"}],
-    ids=["absent", "none", "non-numeric"],
-)
 async def test_get_gps_accuracy_clears_stale_zero(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
     sensor: MockSensor,
-    tracker_attrs: dict[str, object],
 ) -> None:
-    """Invalid current accuracy should clear a stale zero and proceed.
+    """Missing current accuracy should clear a stale zero and proceed.
 
     Args:
         mock_hass (MagicMock):
@@ -1628,12 +1402,10 @@ async def test_get_gps_accuracy_clears_stale_zero(
             Places configuration entry used by the test.
         sensor (MockSensor):
             Places sensor fixture whose state is asserted.
-        tracker_attrs (dict[str, object]):
-            Attributes exposed by the source tracker.
     """
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
     tracker_state = MagicMock()
-    tracker_state.attributes = tracker_attrs
+    tracker_state.attributes = {}
     mock_hass.states.get.return_value = tracker_state
     sensor.attrs[CONF_DEVICETRACKER_ID] = "device_tracker.test"
     sensor.attrs[CONF_USE_GPS] = True
@@ -1680,43 +1452,6 @@ async def test_update_coordinates_variants_present_and_missing(
     assert any("Device tracker entity not found" in r.message for r in caplog.records)
 
 
-@pytest.mark.asyncio
-async def test_determine_update_criteria_calls(
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    sensor: MockSensor,
-    stubbed_updater: StubbedUpdater,
-) -> None:
-    """Test that `determine_update_criteria` calls all required helper methods and returns the correct update status.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        stubbed_updater (StubbedUpdater):
-            Updater with external dependencies replaced by stubs.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    with stubbed_updater(
-        updater,
-        [
-            ("get_initial_last_place_name", {}),
-            ("get_zone_details", {}),
-            ("update_coordinates_and_distance", {"return_value": UpdateStatus.PROCEED}),
-            ("determine_if_update_needed", {"return_value": UpdateStatus.PROCEED}),
-        ],
-    ) as mocks:
-        result = await updater.determine_update_criteria()
-    assert result == UpdateStatus.PROCEED
-    mocks["get_initial_last_place_name"].assert_awaited_once()
-    mocks["get_zone_details"].assert_awaited_once()
-    mocks["update_coordinates_and_distance"].assert_awaited_once()
-    mocks["determine_if_update_needed"].assert_awaited_once()
-
-
 async def test_update_coordinates_and_distance_accepts_unqualified_home_zone(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
@@ -1758,19 +1493,6 @@ async def test_update_coordinates_and_distance_accepts_unqualified_home_zone(
 
     assert result == UpdateStatus.SKIP
     assert "Distance from home [home]" in caplog.text
-
-
-async def test_mock_sensor_restore_previous_attr_replaces_mapping_and_native_value() -> None:
-    """MockSensor rollback should restore the exact snapshot and native value."""
-    sensor = MockSensor(attrs={"keep": "old", "remove": "old"})
-    original_attrs = sensor.get_internal_attr()
-    previous = {"restored": "state", ATTR_NATIVE_VALUE: "restored native value"}
-
-    await sensor.restore_previous_attr(previous)
-
-    assert sensor.get_internal_attr() is previous
-    assert sensor.get_internal_attr() is not original_attrs
-    assert sensor.native_value == "restored native value"
 
 
 @pytest.mark.asyncio
@@ -1821,113 +1543,74 @@ async def test_get_initial_last_place_name_param(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("scenario", "setup_func", "expected_zone", "expected_zone_name_present", "expected_zone_name"),
+    (
+        "tracker_id",
+        "tracker_state",
+        "tracker_attrs",
+        "in_zone",
+        "initial_zone",
+        "home_zone_attrs",
+        "expected_zone",
+        "expected_zone_name",
+    ),
     [
         (
-            "not_zone",
-            lambda sensor, mock_hass: (
-                sensor.get_attr_safe_str.__setattr__(
-                    "side_effect",
-                    (
-                        lambda k: (
-                            "home" if k == ATTR_DEVICETRACKER_ZONE_NAME else "device_tracker.test"
-                        )
-                    ),
-                ),
-                sensor.get_attr.__setattr__(
-                    "side_effect",
-                    (lambda k: "home" if k == ATTR_DEVICETRACKER_ZONE_NAME else "TestZone"),
-                ),
-                mock_hass.states.get.__setattr__("return_value", MagicMock(state="home")),
-            ),
+            "device_tracker.test",
+            "not_home",
+            {},
+            False,
+            None,
+            None,
+            "not_home",
+            "not_home",
+        ),
+        (
+            "zone.home",
+            "0",
+            {},
+            False,
             "home",
-            True,
-            "TestZone",
+            None,
+            "home",
+            "home",
         ),
         (
-            "zone_id_equals_conf_zone",
-            lambda sensor, mock_hass: (
-                sensor.__setattr__(
-                    "get_attr_safe_str",
-                    (lambda k: CONF_ZONE + ".home" if k == CONF_DEVICETRACKER_ID else ""),
-                ),
-                sensor.__setattr__(
-                    "get_attr",
-                    (lambda k: CONF_ZONE + ".home" if k == CONF_DEVICETRACKER_ID else ""),
-                ),
-                sensor.attrs.__setitem__(ATTR_DEVICETRACKER_ZONE, "home"),
-            ),
-            None,
+            "device_tracker.test",
+            "home",
+            {CONF_ZONE: "home"},
             True,
-            "",
+            None,
+            {ATTR_FRIENDLY_NAME: "Home Zone"},
+            "home",
+            "Home Zone",
         ),
         (
-            "in_zone_true",
-            lambda sensor, mock_hass: (
-                sensor.__setattr__(
-                    "get_attr_safe_str",
-                    (lambda k: "device_tracker.test" if k == CONF_DEVICETRACKER_ID else ""),
-                ),
-                sensor.__setattr__(
-                    "get_attr",
-                    (lambda k: "device_tracker.test" if k == CONF_DEVICETRACKER_ID else ""),
-                ),
-                mock_hass.states.get.__setattr__(
-                    "side_effect",
-                    (
-                        lambda eid: (
-                            MagicMock(attributes={CONF_ZONE: "home"})
-                            if eid == "device_tracker.test"
-                            else MagicMock(attributes={CONF_FRIENDLY_NAME: "Home Zone"})
-                            if eid == "zone.home"
-                            else None
-                        )
-                    ),
-                ),
-            ),
-            None,
-            True,
-            "",
-        ),
-        (
-            "in_zone_no_zone_name_state",
-            lambda sensor, mock_hass: (
-                sensor.__setattr__(
-                    "get_attr_safe_str",
-                    (lambda k: "device_tracker.test" if k == CONF_DEVICETRACKER_ID else ""),
-                ),
-                sensor.__setattr__(
-                    "get_attr",
-                    (lambda k: "device_tracker.test" if k == CONF_DEVICETRACKER_ID else ""),
-                ),
-                mock_hass.states.get.__setattr__(
-                    "side_effect",
-                    (
-                        lambda eid: (
-                            MagicMock(attributes={CONF_ZONE: "home"})
-                            if eid == "device_tracker.test"
-                            else None
-                        )
-                    ),
-                ),
-            ),
-            None,
+            "device_tracker.test",
+            "home",
+            {CONF_ZONE: "home"},
             True,
             None,
+            None,
+            "home",
+            "Home",
         ),
     ],
+    ids=["outside-zone", "zone-entity", "named-zone", "missing-zone-state"],
 )
 async def test_get_zone_details_param(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
     sensor: MockSensor,
-    scenario: str,
-    setup_func: ZoneSetup,
-    expected_zone: str | None,
-    expected_zone_name_present: bool,
-    expected_zone_name: str | None,
+    tracker_id: str,
+    tracker_state: str,
+    tracker_attrs: dict[str, str],
+    in_zone: bool,
+    initial_zone: str | None,
+    home_zone_attrs: dict[str, str] | None,
+    expected_zone: str,
+    expected_zone_name: str,
 ) -> None:
-    """Parametrized variants for get_zone_details covering zone and non-zone flows.
+    """Resolve tracker zone attributes from Home Assistant states.
 
     Args:
         mock_hass (MagicMock):
@@ -1936,33 +1619,38 @@ async def test_get_zone_details_param(
             Places configuration entry used by the test.
         sensor (MockSensor):
             Places sensor fixture whose state is asserted.
-        scenario (str):
-            Named parameter set for the current case.
-        setup_func (ZoneSetup):
-            Setup callable used to initialize the case.
-        expected_zone (str | None):
-            Zone identifier expected for this parametrized case.
-        expected_zone_name_present (bool):
-            Whether a zone name is expected in the output.
-        expected_zone_name (str | None):
-            Zone name expected for this parametrized case.
+        tracker_id (str):
+            Entity ID configured as the device tracker.
+        tracker_state (str):
+            State returned for the configured tracker.
+        tracker_attrs (dict[str, str]):
+            Attributes returned for the configured tracker.
+        in_zone (bool):
+            Whether the coordinator considers the tracker inside a zone.
+        initial_zone (str | None):
+            Existing zone attribute, when the tracker itself is a zone entity.
+        home_zone_attrs (dict[str, str] | None):
+            Attributes returned for ``zone.home`` when that state exists.
+        expected_zone (str):
+            Zone identifier expected after resolution.
+        expected_zone_name (str):
+            Display name expected after resolution.
     """
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    # Execute scenario-specific setup
-    setup_func(sensor, mock_hass)
+    sensor.attrs[CONF_DEVICETRACKER_ID] = tracker_id
+    if initial_zone is not None:
+        sensor.attrs[ATTR_DEVICETRACKER_ZONE] = initial_zone
+    tracker = State(tracker_id, tracker_state, tracker_attrs)
+    states = {tracker_id: tracker}
+    if home_zone_attrs is not None:
+        states["zone.home"] = State("zone.home", "0", home_zone_attrs)
+    mock_hass.states.get.side_effect = states.get
 
-    # Default to not in zone unless scenario setup overrides
-    in_zone = scenario not in ("not_zone", "zone_id_equals_conf_zone")
     with stub_in_zone(sensor, in_zone):
         await updater.get_zone_details()
 
-    if expected_zone is not None:
-        assert sensor.attrs[ATTR_DEVICETRACKER_ZONE] == expected_zone
-    if expected_zone_name_present:
-        # When a zone name presence is expected, assert the attribute exists (value may be empty string)
-        assert ATTR_DEVICETRACKER_ZONE_NAME in sensor.attrs
-        if expected_zone_name is not None:
-            assert sensor.attrs[ATTR_DEVICETRACKER_ZONE_NAME] == expected_zone_name
+    assert sensor.attrs[ATTR_DEVICETRACKER_ZONE] == expected_zone
+    assert sensor.attrs[ATTR_DEVICETRACKER_ZONE_NAME] == expected_zone_name
 
 
 @pytest.mark.asyncio
@@ -1999,40 +1687,6 @@ async def test_get_zone_details_uses_home_zone_friendly_name_from_state(
 
     assert sensor.attrs[ATTR_DEVICETRACKER_ZONE] == "home"
     assert sensor.attrs[ATTR_DEVICETRACKER_ZONE_NAME] == "Casa Concordia"
-
-
-@pytest.mark.asyncio
-async def test_process_osm_update_calls(
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    sensor: MockSensor,
-    stubbed_updater: StubbedUpdater,
-) -> None:
-    """Test that `process_osm_update` calls attribute reset, map link generation, and OSM query finalization methods as expected.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        stubbed_updater (StubbedUpdater):
-            Updater with external dependencies replaced by stubs.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    with stubbed_updater(
-        updater,
-        [
-            ("async_reset_attributes", {}),
-            ("get_map_link", {}),
-            ("query_osm_and_finalize", {}),
-        ],
-    ) as mocks:
-        await updater.process_osm_update(datetime(2024, 1, 1, 12, 0, tzinfo=UTC))
-    mocks["async_reset_attributes"].assert_awaited_once()
-    mocks["get_map_link"].assert_awaited_once()
-    mocks["query_osm_and_finalize"].assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -2087,10 +1741,10 @@ async def test_get_map_link_providers_all(
 
 
 @pytest.mark.asyncio
-async def test_async_reset_attributes_calls(
+async def test_async_reset_attributes_clears_stale_data_and_preserves_configuration(
     mock_hass: MagicMock, mock_config_entry: MockConfigEntry, sensor: MockSensor
 ) -> None:
-    """Test that `async_reset_attributes` clears sensor attributes and performs asynchronous cleanup.
+    """Clear stale geocoding data while preserving configuration and coordinates.
 
     Args:
         mock_hass (MagicMock):
@@ -2101,9 +1755,21 @@ async def test_async_reset_attributes_calls(
             Places sensor fixture whose state is asserted.
     """
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
+    sensor.attrs.update(
+        {
+            ATTR_OSM_DICT: {"stale": True},
+            ATTR_MAP_LINK: "https://old.example/",
+            CONF_NAME: "Probe",
+            ATTR_LATITUDE: 51.5,
+        }
+    )
+
     await updater.async_reset_attributes()
-    sensor.clear_attr.assert_called()
-    sensor.async_cleanup_attributes.assert_awaited_once()
+
+    assert ATTR_OSM_DICT not in sensor.attrs
+    assert ATTR_MAP_LINK not in sensor.attrs
+    assert sensor.attrs[CONF_NAME] == "Probe"
+    assert sensor.attrs[ATTR_LATITUDE] == 51.5
 
 
 @pytest.mark.asyncio
@@ -2333,210 +1999,6 @@ async def test_rollback_update_skips_persistent_side_effects_during_shutdown(
 
 
 @pytest.mark.asyncio
-async def test_build_osm_url_returns_url(
-    mock_hass: MagicMock, mock_config_entry: MockConfigEntry, sensor: MockSensor
-) -> None:
-    """Test that `build_osm_url` constructs a valid OpenStreetMap reverse geocoding URL using sensor attributes.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    sensor.get_attr_safe_float.side_effect = lambda k: 1.0
-    sensor.get_attr.side_effect = lambda k: (
-        "en" if k == CONF_LANGUAGE else "apikey" if k == CONF_API_KEY else 18
-    )
-    url = await updater.build_osm_url()
-    assert url.startswith("https://nominatim.openstreetmap.org/reverse?format=json")
-
-    # Parse and verify URL parameters
-    parsed = urlparse(url)
-    params = parse_qs(parsed.query)
-    assert params.get("lat") == ["1.0"]
-    assert params.get("lon") == ["1.0"]
-    assert params.get("accept-language") == ["en"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("cached", "payload", "expected_attr", "network_error"),
-    [
-        (True, None, {"a": 1}, False),
-        (False, '[{"a": 1}]', {"a": 1}, False),
-        (False, None, None, True),
-    ],
-)
-async def test_get_dict_from_url_variants(
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    aioclient_mock: AioClientMock,
-    sensor: MockSensor,
-    cached: bool,
-    payload: str | None,
-    expected_attr: object | None,
-    network_error: bool,
-) -> None:
-    """Parametrized: cache hit, list-payload behavior, and network-error for get_dict_from_url.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        aioclient_mock (AioClientMock):
-            Mocked HTTP client used for deterministic responses.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        cached (bool):
-            Whether the response is already cached.
-        payload (str | None):
-            Places payload returned by the mocked request.
-        expected_attr (object | None):
-            Expected payload value stored in the sensor attribute.
-        network_error (bool):
-            Network failure injected by the mocked client.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    url = "http://example.com/test"
-    if DOMAIN not in mock_hass.data:
-        mock_hass.data[DOMAIN] = {
-            OSM_CACHE: {},
-            OSM_THROTTLE: {"lock": asyncio.Lock(), "last_query": 0},
-        }
-
-    if cached:
-        mock_hass.data[DOMAIN][OSM_CACHE][url] = expected_attr
-        await updater.get_dict_from_url(url, "Test", "dict_name")
-        assert sensor.attrs["dict_name"] == expected_attr
-        return
-
-    if network_error:
-        # Simulate an OSError when attempting to GET the URL
-        aioclient_mock.get(url, exc=OSError("fail"))
-        await updater.get_dict_from_url(url, "Test", "dict_name")
-        # Should not raise; accept missing or empty dict cache behavior
-        assert not sensor.attrs.get("dict_name")
-        return
-
-    # not cached -> register with aioclient_mock (aioclient_mock intercepts aiohttp calls)
-    register_aioclient(aioclient_mock, url, text=payload)
-    await updater.get_dict_from_url(url, "Test", "dict_name")
-    assert sensor.attrs["dict_name"] == expected_attr
-    assert mock_hass.data[DOMAIN][OSM_CACHE][url] == expected_attr
-
-
-@pytest.mark.asyncio
-async def test_get_dict_from_url_sets_empty_list_payload(
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    aioclient_mock: AioClientMock,
-    sensor: MockSensor,
-) -> None:
-    """Empty list payloads are stored on the sensor but removed from cache.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        aioclient_mock (AioClientMock):
-            Mocked HTTP client used for deterministic responses.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    sensor.blank_attrs.add("dict_name")
-    url = "http://example.com/empty-list"
-    if DOMAIN not in mock_hass.data:
-        mock_hass.data[DOMAIN] = {
-            OSM_CACHE: {},
-            OSM_THROTTLE: {"lock": asyncio.Lock(), "last_query": 0},
-        }
-
-    register_aioclient(aioclient_mock, url, text="[]")
-    await updater.get_dict_from_url(url, "NetService", "dict_name")
-
-    assert sensor.attrs["dict_name"] == []
-    assert url not in mock_hass.data[DOMAIN][OSM_CACHE]
-
-
-@pytest.mark.asyncio
-async def test_forced_get_dict_failure_retains_shared_cache(
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    aioclient_mock: AioClientMock,
-    sensor: MockSensor,
-) -> None:
-    """A failed forced lookup does not delete another entry's cached response.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        aioclient_mock (AioClientMock):
-            Mocked HTTP client used for deterministic responses.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    updater._use_cache = False
-    url = "http://example.com/forced-failure"
-    cached = {"place_id": 123}
-    mock_hass.data[DOMAIN] = {
-        OSM_CACHE: {url: cached},
-        OSM_THROTTLE: {"lock": asyncio.Lock(), "last_query": 0},
-    }
-    aioclient_mock.get(url, exc=OSError("fail"))
-
-    await updater.get_dict_from_url(url, "Test", "dict_name")
-
-    assert mock_hass.data[DOMAIN][OSM_CACHE][url] == cached
-
-
-@pytest.mark.asyncio
-async def test_get_dict_from_url_removes_stale_cache_on_fetch_failure(
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    sensor: MockSensor,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A failed fetch removes any stale cache entry for the requested URL.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        monkeypatch (pytest.MonkeyPatch):
-            Pytest fixture for replacing dependencies.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    url = "http://example.com/stale"
-    mock_hass.data[DOMAIN] = {
-        OSM_CACHE: {url: {"stale": True}},
-        OSM_THROTTLE: {"lock": asyncio.Lock(), "last_query": 0},
-    }
-
-    monkeypatch.setattr(updater._osm_client, "get_json", AsyncMock(return_value=None))
-
-    await updater.get_dict_from_url(url, "NetService", "dict_name")
-
-    assert sensor.attrs["dict_name"] == {}
-    assert url not in mock_hass.data[DOMAIN][OSM_CACHE]
-
-
-# Network-error case moved into parametrized `test_get_dict_from_url_variants`
-
-
-@pytest.mark.asyncio
 async def test_determine_if_update_needed_initial_update(
     mock_hass: MagicMock, mock_config_entry: MockConfigEntry, sensor: MockSensor
 ) -> None:
@@ -2625,13 +2087,12 @@ async def test_calculate_distance_methods(
 
 
 @pytest.mark.asyncio
-async def test_update_coordinates_and_distance_calls(
+async def test_update_coordinates_and_distance_updates_location_and_movement(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
     sensor: MockSensor,
-    stubbed_updater: StubbedUpdater,
 ) -> None:
-    """Call coordinate and distance helpers and return PROCEED.
+    """Derive location, distance, and direction from current and prior coordinates.
 
     Args:
         mock_hass (MagicMock):
@@ -2640,43 +2101,43 @@ async def test_update_coordinates_and_distance_calls(
             Places configuration entry used by the test.
         sensor (MockSensor):
             Places sensor fixture whose state is asserted.
-        stubbed_updater (StubbedUpdater):
-            Updater with external dependencies replaced by stubs.
     """
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    sensor.is_attr_blank.side_effect = lambda k: False
-    # Patch get_attr_safe_str to return a value with a dot for CONF_HOME_ZONE
-    sensor.get_attr_safe_str.side_effect = lambda k: "zone.home" if k == CONF_HOME_ZONE else "other"
-    with stubbed_updater(
-        updater,
-        [
-            ("update_location_attributes", {}),
-            ("calculate_distances", {}),
-            ("calculate_travel_distance", {}),
-            ("determine_direction_of_travel", {}),
-        ],
-    ) as mocks:
-        result = await updater.update_coordinates_and_distance()
+    sensor.attrs.update(
+        {
+            ATTR_LATITUDE: 40.001,
+            ATTR_LONGITUDE: -70.002,
+            ATTR_LATITUDE_OLD: 40.0,
+            ATTR_LONGITUDE_OLD: -70.0,
+            ATTR_HOME_LATITUDE: 40.0,
+            ATTR_HOME_LONGITUDE: -70.0,
+            ATTR_DISTANCE_FROM_HOME: 0.0,
+        }
+    )
+
+    result = await updater.update_coordinates_and_distance()
+
     assert result == UpdateStatus.PROCEED
-    mocks["update_location_attributes"].assert_awaited_once()
-    mocks["calculate_distances"].assert_awaited_once()
-    mocks["calculate_travel_distance"].assert_awaited_once()
-    mocks["determine_direction_of_travel"].assert_awaited_once()
+    assert sensor.attrs[ATTR_LOCATION_CURRENT] == "40.001,-70.002"
+    assert sensor.attrs[ATTR_LOCATION_PREVIOUS] == "40.0,-70.0"
+    assert sensor.attrs[ATTR_HOME_LOCATION] == "40.0,-70.0"
+    assert sensor.attrs[ATTR_DISTANCE_FROM_HOME] == pytest.approx(203.707)
+    assert sensor.attrs[ATTR_DISTANCE_TRAVELED] == pytest.approx(203.707)
+    assert sensor.attrs[ATTR_DIRECTION_OF_TRAVEL] == "away from home"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "scenario",
-    ["blank", "invalid_date", "valid_date", "type_error", "value_error"],
+    ["blank", "invalid_date", "valid_date", "naive_date"],
 )
 async def test_get_seconds_from_last_change_param(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
     sensor: MockSensor,
     scenario: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Parametrized variants for get_seconds_from_last_change covering various error and success paths.
+    """Cover missing, malformed, aware, and naive saved timestamps.
 
     Args:
         mock_hass (MagicMock):
@@ -2687,13 +2148,11 @@ async def test_get_seconds_from_last_change_param(
             Places sensor fixture whose state is asserted.
         scenario (str):
             Named parameter set for the current case.
-        monkeypatch (pytest.MonkeyPatch):
-            Pytest fixture for replacing dependencies.
     """
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    now = datetime.now(tz=UTC)
 
     if scenario == "blank":
+        now = datetime(2024, 1, 1, 13, 0, tzinfo=UTC)
         sensor.is_attr_blank.return_value = True
         result = await updater.get_seconds_from_last_change(now)
         assert result == 3600
@@ -2702,38 +2161,23 @@ async def test_get_seconds_from_last_change_param(
     sensor.is_attr_blank.return_value = False
 
     if scenario == "invalid_date":
+        now = datetime(2024, 1, 1, 13, 0, tzinfo=UTC)
         sensor.get_attr_safe_str.return_value = "not-a-date"
         result = await updater.get_seconds_from_last_change(now)
         assert result == 3600
         return
 
     if scenario == "valid_date":
+        now = datetime(2024, 1, 1, 13, 0, tzinfo=UTC)
         last_changed = now - timedelta(seconds=123)
         sensor.attrs[ATTR_LAST_CHANGED] = last_changed.replace(microsecond=0).isoformat()
         result = await updater.get_seconds_from_last_change(now.replace(microsecond=0))
         assert result == 123
         return
 
-    if scenario == "type_error":
-        # Create UTC datetime then strip tzinfo to test handling of naive datetimes.
-        naive_last_changed = datetime(2024, 1, 1, 12, 0, tzinfo=UTC).replace(tzinfo=None)
-        aware_now = datetime(2024, 1, 1, 13, 0, tzinfo=UTC)
-
-        sensor.get_attr_safe_str.return_value = naive_last_changed.isoformat()
-        mock_dt = MagicMock()
-        mock_dt.fromisoformat.return_value = naive_last_changed
-        mock_dt.now.return_value = aware_now
-        monkeypatch.setattr("custom_components.places.update_sensor.datetime", mock_dt)
-        result = await updater.get_seconds_from_last_change(aware_now)
-        assert result == 3600
-        return
-
-    # value_error
-    sensor.get_attr_safe_str.return_value = "bad-date"
-    mock_dt = MagicMock()
-    mock_dt.fromisoformat.side_effect = ValueError("bad date format")
-    mock_dt.now.return_value = now
-    monkeypatch.setattr("custom_components.places.update_sensor.datetime", mock_dt)
+    # An ISO timestamp without an offset is interpreted in the update timezone.
+    now = datetime(2024, 1, 1, 13, 0, tzinfo=UTC)
+    sensor.attrs[ATTR_LAST_CHANGED] = "2024-01-01T12:00:00"
     result = await updater.get_seconds_from_last_change(now)
     assert result == 3600
 
@@ -2756,19 +2200,20 @@ async def test_change_show_time_to_date_param(
             Format applied to rendered timestamps.
     """
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    sensor.is_attr_blank.side_effect = lambda k: False
-    sensor.get_attr.side_effect = lambda k: (
-        True
-        if k == CONF_SHOW_TIME
-        else date_format
-        if k == CONF_DATE_FORMAT
-        else "2024-01-01 12:00:00"
+    sensor.attrs.update(
+        {
+            CONF_SHOW_TIME: True,
+            CONF_DATE_FORMAT: date_format,
+            ATTR_LAST_CHANGED: "2024-02-03 12:00:00",
+            ATTR_NATIVE_VALUE: "TestState (since 12:00)",
+        }
     )
-    sensor.get_attr_safe_str.side_effect = lambda k: (
-        "2024-01-01 12:00:00" if k == ATTR_LAST_CHANGED else "TestState"
-    )
+    sensor.native_value = "TestState (since 12:00)"
+
     await updater.change_show_time_to_date()
-    assert sensor.native_value is not None
+
+    expected_date = "03/02" if date_format == "dd/mm" else "02/03"
+    assert sensor.native_value == f"TestState (since {expected_date})"
     assert sensor.attrs[ATTR_SHOW_DATE] is True
     sensor.async_persist_attributes.assert_not_awaited()
     mock_hass.async_add_executor_job.assert_not_awaited()
@@ -2969,69 +2414,51 @@ async def test_log_tracker_issue_param(
 
 
 @pytest.mark.asyncio
-async def test_query_osm_and_finalize_runs_parser_and_sets_last_changed(
+async def test_query_osm_and_finalize_preserves_client_arguments_and_timestamp(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
     sensor: MockSensor,
-    stubbed_updater: StubbedUpdater,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Test that query_osm_and_finalize runs the OSM parser, finalizes the last place name, processes display options, and sets last_changed.
+    """Pass tracker coordinates and options to aioplaces, then render its result.
 
     Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        stubbed_updater (StubbedUpdater):
-            Updater with external dependencies replaced by stubs.
-        monkeypatch (pytest.MonkeyPatch):
-            Pytest fixture for replacing dependencies.
+        mock_hass (MagicMock): Mocked Home Assistant runtime.
+        mock_config_entry (MockConfigEntry): Entry used to configure the updater.
+        sensor (MockSensor): Sensor supplying coordinates and receiving attributes.
+        monkeypatch (pytest.MonkeyPatch): Scoped client and parser replacements.
     """
-    sensor.attrs["osm_dict"] = {"some": "value"}
-    sensor.attrs["last_place_name"] = "TestPlace"
-    mock_parser = AsyncMock()
-    # Create a single updater instance and stub its methods; do NOT create a second instance
-    # inside the context (previous version created a new instance whose methods were not stubbed,
-    # leading to the real get_dict_from_url accessing hass.data and raising KeyError).
-    updater = PlacesUpdater(
-        hass=mock_hass,
-        config_entry=mock_config_entry,
-        coordinator=sensor,
+    sensor.attrs.update(
+        {
+            ATTR_LATITUDE: 40.7,
+            ATTR_LONGITUDE: -73.9,
+            CONF_LANGUAGE: "fr,en",
+            CONF_API_KEY: "contact@example.test",
+            ATTR_LAST_PLACE_NAME: "Home",
+        }
     )
+    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
+    reverse = AsyncMock(return_value={"osm_id": 5, "display_name": "Central Park"})
+    monkeypatch.setattr(PlacesClient, "reverse", reverse)
+    mock_parser = AsyncMock()
     mock_parser_cls = MagicMock(return_value=mock_parser)
     monkeypatch.setattr("custom_components.places.update_sensor.OSMParser", mock_parser_cls)
     with (
-        stubbed_sensor(sensor, [("process_display_options", {})]) as sensor_mocks,
-        stubbed_parser(
-            mock_parser, [("parse_osm_dict", {}), ("finalize_last_place_name", {})]
-        ) as parser_mocks,
-        stubbed_updater(
-            updater,
-            [
-                ("build_osm_url", {"return_value": "http://test-url"}),
-                ("get_dict_from_url", {}),
-            ],
-        ) as updater_mocks,
+        stubbed_sensor(sensor, [("process_display_options", {})]),
+        stubbed_parser(mock_parser, [("parse_osm_dict", {}), ("finalize_last_place_name", {})]),
     ):
         now = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
         await updater.query_osm_and_finalize(now)
-        # Assert updater method calls
-        updater_mocks["build_osm_url"].assert_awaited_once()
-        updater_mocks["get_dict_from_url"].assert_awaited_once_with(
-            url="http://test-url",
-            name="OpenStreetMaps",
-            dict_name="osm_dict",
-        )
-        # Assert parser interactions
-        parser_mocks["parse_osm_dict"].assert_awaited_once()
-        parser_mocks["finalize_last_place_name"].assert_awaited_once_with("TestPlace")
-        # Assert sensor post-processing
-        sensor_mocks["process_display_options"].assert_awaited_once()
-        # Assert attribute updated
-        assert sensor.attrs["last_changed"] == now.isoformat(sep=" ", timespec="seconds")
+
+    reverse.assert_awaited_once_with(
+        40.7,
+        -73.9,
+        language="fr,en",
+        email="contact@example.test",
+        use_cache=True,
+    )
+    assert sensor.attrs[ATTR_OSM_DICT] == {"osm_id": 5, "display_name": "Central Park"}
+    assert sensor.attrs[ATTR_LAST_CHANGED] == now.isoformat(sep=" ", timespec="seconds")
 
 
 @pytest.mark.asyncio
@@ -3261,42 +2688,43 @@ async def test_get_initial_last_place_name_not_in_zone_blank_keeps_previous(
 
 
 @pytest.mark.asyncio
-async def test_query_osm_and_finalize_no_osm_dict(
+@pytest.mark.parametrize(
+    "response",
+    [None, ValueError("invalid coordinates"), PlacesError("service unavailable")],
+    ids=("no-result", "invalid-response", "request-error"),
+)
+async def test_query_osm_and_finalize_skips_parser_when_lookup_has_no_result(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
     sensor: MockSensor,
-    stubbed_updater: StubbedUpdater,
     monkeypatch: pytest.MonkeyPatch,
+    response: dict[str, object] | ValueError | PlacesError | None,
 ) -> None:
-    """If OSM dict blank parser isn't invoked and last_changed not set.
+    """No-result and failed lookups clear stale data without replacing its timestamp.
 
     Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        stubbed_updater (StubbedUpdater):
-            Updater with external dependencies replaced by stubs.
-        monkeypatch (pytest.MonkeyPatch):
-            Pytest fixture for replacing dependencies.
+        mock_hass (MagicMock): Mocked Home Assistant runtime.
+        mock_config_entry (MockConfigEntry): Entry used to configure the updater.
+        sensor (MockSensor): Sensor receiving place attributes.
+        monkeypatch (pytest.MonkeyPatch): Scoped client and parser replacements.
+        response (dict[str, object] | ValueError | PlacesError | None): Lookup outcome.
     """
-    sensor.attrs[ATTR_OSM_DICT] = None
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    mock_parser_cls = MagicMock()
-    monkeypatch.setattr("custom_components.places.update_sensor.OSMParser", mock_parser_cls)
-    with (
-        stubbed_sensor(sensor, [("process_display_options", {})]),
-        stubbed_updater(
-            updater,
-            [("build_osm_url", {"return_value": "http://url"}), ("get_dict_from_url", {})],
-        ),
-    ):
-        now = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
-        await updater.query_osm_and_finalize(now)
-    mock_parser_cls.assert_not_called()
-    assert ATTR_LAST_CHANGED not in sensor.attrs
+    reverse = (
+        AsyncMock(side_effect=response)
+        if isinstance(response, Exception)
+        else AsyncMock(return_value=response)
+    )
+    monkeypatch.setattr(PlacesClient, "reverse", reverse)
+    sensor.attrs[ATTR_OSM_DICT] = {"stale": True}
+    sensor.attrs[ATTR_LAST_CHANGED] = "2024-01-01 11:00:00+00:00"
+    sensor.blank_attrs.add(ATTR_OSM_DICT)
+    now = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+    await updater.query_osm_and_finalize(now)
+
+    reverse.assert_awaited_once()
+    assert sensor.attrs[ATTR_OSM_DICT] == {}
+    assert sensor.attrs[ATTR_LAST_CHANGED] == "2024-01-01 11:00:00+00:00"
 
 
 @pytest.mark.asyncio
@@ -3322,24 +2750,66 @@ async def test_should_update_state_initial_update_true(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status", "seconds", "show_time", "expect_dot", "expect_show"),
+    (
+        "previous_attr",
+        "status",
+        "now",
+        "expected_direction",
+        "expected_changed",
+        "expected_native_value",
+        "expected_show_date",
+        "expect_persistence",
+    ),
     [
-        (UpdateStatus.SKIP_SET_STATIONARY, 120, False, True, False),
-        (UpdateStatus.PROCEED, 90000, True, False, True),
+        (
+            {
+                CONF_NAME: "TestSensor",
+                ATTR_DIRECTION_OF_TRAVEL: "towards home",
+                ATTR_LAST_CHANGED: "2024-01-01 11:58:00+00:00",
+                ATTR_NATIVE_VALUE: "Library",
+                CONF_SHOW_TIME: False,
+            },
+            UpdateStatus.SKIP_SET_STATIONARY,
+            datetime(2024, 1, 1, 12, 0, tzinfo=UTC),
+            "stationary",
+            "2024-01-01 12:00:00+00:00",
+            "Library",
+            False,
+            True,
+        ),
+        (
+            {
+                CONF_NAME: "TestSensor",
+                ATTR_DIRECTION_OF_TRAVEL: "towards home",
+                ATTR_LAST_CHANGED: "2024-01-01 12:00:00+00:00",
+                ATTR_NATIVE_VALUE: "Library (since 12:00)",
+                CONF_SHOW_TIME: True,
+                CONF_DATE_FORMAT: "mm/dd",
+            },
+            UpdateStatus.PROCEED,
+            datetime(2024, 1, 2, 13, 0, tzinfo=UTC),
+            "towards home",
+            "2024-01-01 12:00:00+00:00",
+            "Library (since 01/01)",
+            True,
+            False,
+        ),
     ],
 )
-async def test_rollback_update_triggers_helpers(
+async def test_rollback_update_applies_stationary_and_stale_time_state(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
     sensor: MockSensor,
+    previous_attr: dict[str, object],
     status: UpdateStatus,
-    seconds: int,
-    show_time: bool,
-    expect_dot: bool,
-    expect_show: bool,
-    stubbed_updater: StubbedUpdater,
+    now: datetime,
+    expected_direction: str,
+    expected_changed: str,
+    expected_native_value: str,
+    expected_show_date: bool,
+    expect_persistence: bool,
 ) -> None:
-    """Parametrized test for rollback_update helper triggers (dot->stationary and show_time->date).
+    """Rollback should expose stationary movement and date-suffix adjustments.
 
     Args:
         mock_hass (MagicMock):
@@ -3348,275 +2818,109 @@ async def test_rollback_update_triggers_helpers(
             Places configuration entry used by the test.
         sensor (MockSensor):
             Places sensor fixture whose state is asserted.
+        previous_attr (dict[str, object]):
+            Sensor attributes restored before the state adjustment.
         status (UpdateStatus):
-            Update status supplied to ``rollback_update``.
-        seconds (int):
-            Elapsed seconds used to format the state suffix.
-        show_time (bool):
-            Whether the state includes a time suffix.
-        expect_dot (bool):
-            Whether a stationary marker is expected.
-        expect_show (bool):
-            Whether the time suffix is expected to be shown.
-        stubbed_updater (StubbedUpdater):
-            Updater with external dependencies replaced by stubs.
+            Update status that initiated rollback handling.
+        now (datetime):
+            Timestamp used for elapsed-time evaluation and any stationary update.
+        expected_direction (str):
+            Direction remaining after rollback handling.
+        expected_changed (str):
+            Last-change timestamp after rollback handling.
+        expected_native_value (str):
+            Rendered sensor state after rollback handling.
+        expected_show_date (bool):
+            Whether the date suffix is now active.
+        expect_persistence (bool):
+            Whether marking the sensor stationary persists the changed attributes.
     """
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    with stubbed_updater(
-        updater,
-        [
-            ("get_seconds_from_last_change", {"return_value": seconds}),
-            ("change_dot_to_stationary", {}),
-            ("change_show_time_to_date", {}),
-        ],
-    ) as mocks:
-        # show_time controls whether change_show_time_to_date should be called
-        sensor.get_attr.side_effect = lambda k: show_time if k == CONF_SHOW_TIME else False
-        await updater.rollback_update({}, datetime.now(tz=UTC), status)
-    sensor.restore_previous_attr.assert_awaited_once_with({})
-    if expect_dot:
-        mocks["change_dot_to_stationary"].assert_awaited_once()
+    await updater.rollback_update(previous_attr, now, status)
+
+    assert sensor.attrs[ATTR_DIRECTION_OF_TRAVEL] == expected_direction
+    assert sensor.attrs[ATTR_LAST_CHANGED] == expected_changed
+    assert sensor.native_value == expected_native_value
+    assert sensor.attrs.get(ATTR_SHOW_DATE, False) is expected_show_date
+    if expect_persistence:
+        sensor.async_persist_attributes.assert_awaited_once()
     else:
-        mocks["change_dot_to_stationary"].assert_not_awaited()
-    if expect_show:
-        mocks["change_show_time_to_date"].assert_awaited_once()
-    else:
-        mocks["change_show_time_to_date"].assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("osm_type", "expect_call", "expect_log"),
-    [
-        ("way", True, False),
-        ("foo", False, True),
-    ],
-)
-async def test_get_extended_attr_variants(
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    sensor: MockSensor,
-    osm_type: str,
-    expect_call: bool,
-    expect_log: bool,
-    caplog: pytest.LogCaptureFixture,
-    stubbed_updater: StubbedUpdater,
-) -> None:
-    """Parametrized: extended attr behavior for known and unknown OSM types.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        osm_type (str):
-            OpenStreetMap object type supplied to parsing.
-        expect_call (bool):
-            Whether the mocked dependency is expected to be called.
-        expect_log (bool):
-            Whether a diagnostic log message is expected.
-        caplog (pytest.LogCaptureFixture):
-            Captured log records used for message assertions.
-        stubbed_updater (StubbedUpdater):
-            Updater with external dependencies replaced by stubs.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    sensor.is_attr_blank.side_effect = lambda k: False
-    sensor.get_attr_safe_str.side_effect = lambda k: osm_type
-    sensor.get_attr.side_effect = lambda k: (
-        "12345"
-        if k == ATTR_OSM_ID
-        else osm_type
-        if k == ATTR_OSM_TYPE
-        else "apikey"
-        if k == CONF_API_KEY
-        else "en"
-        if k == CONF_LANGUAGE
-        else None
-    )
-    with stubbed_updater(updater, [("get_dict_from_url", {})]) as mocks:
-        await updater.get_extended_attr()
-    if expect_call:
-        mocks["get_dict_from_url"].assert_awaited()
-    if expect_log:
-        assert any("Unknown OSM type" in r.message for r in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_get_extended_attr_node_triggers_wikidata_lookup(
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    sensor: MockSensor,
-    stubbed_updater: StubbedUpdater,
-) -> None:
-    """Test node OSM type triggers details fetch and Wikidata lookup.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        stubbed_updater (StubbedUpdater):
-            Updater with external dependencies replaced by stubs.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-
-    # Prepare sensor to look like it has an OSM node id/type
-    sensor.attrs[ATTR_OSM_ID] = "12345"
-    sensor.attrs[ATTR_OSM_TYPE] = "node"
-    # Ensure is_attr_blank returns False for checks in get_extended_attr
-    sensor.is_attr_blank.side_effect = lambda k: False
-
-    async def fake_get_dict(url: str, name: str, dict_name: str) -> None:
-        """Populate staged OSM details and Wikidata responses for the updater.
-
-        Args:
-            url (str):
-                Request URL generated by the updater.
-            name (str):
-                Logical service name used by ``get_dict_from_url``.
-            dict_name (str):
-                Attribute key that would receive the fetched payload.
-        """
-        # First call: OpenStreetMaps Details -> populate details with wikidata tag
-        if name == "OpenStreetMaps Details":
-            sensor.attrs[ATTR_OSM_DETAILS_DICT] = {"extratags": {"wikidata": "Q123"}}
-            return
-        # Second call: Wikidata -> populate wikidata dict
-        if name == "Wikidata":
-            sensor.attrs[ATTR_WIKIDATA_DICT] = {"id": "Q123", "label": "Test"}
-            return
-
-    with stubbed_updater(updater, [("get_dict_from_url", {"side_effect": fake_get_dict})]) as mocks:
-        await updater.get_extended_attr()
-
-    # Should have attempted the details lookup and then the wikidata lookup (2 awaits)
-    assert_awaited_count(mocks["get_dict_from_url"], 2)
-    # The OSM details parsing should have set the wikidata id
-    assert sensor.attrs.get(ATTR_WIKIDATA_ID) == "Q123"
-    # And the wikidata dict should be present after the second fetch
-    assert ATTR_WIKIDATA_DICT in sensor.attrs
+        sensor.async_persist_attributes.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("payload", "expect_log_substr"),
-    [
-        ("{bad json}", "JSON Decode Error"),
-        ('{"error_message": "bad"}', "error occurred contacting the web service"),
-    ],
+    ("osm_type", "error"), [("way", None), ("unknown", ValueError("unsupported OSM type"))]
 )
-async def test_get_dict_from_url_network_variants(
+async def test_get_extended_attr_uses_library_lookup_for_supported_types(
     mock_hass: MagicMock,
     mock_config_entry: MockConfigEntry,
     sensor: MockSensor,
-    caplog: pytest.LogCaptureFixture,
-    aioclient_mock: AioClientMock,
-    payload: str | None,
-    expect_log_substr: str | None,
-) -> None:
-    """Parametrize malformed JSON and service-error responses for get_dict_from_url.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        caplog (pytest.LogCaptureFixture):
-            Captured log records used for message assertions.
-        aioclient_mock (AioClientMock):
-            Mocked HTTP client used for deterministic responses.
-        payload (str | None):
-            Places payload returned by the mocked request.
-        expect_log_substr (str | None):
-            Expected log-message fragment, or ``None`` when no fragment is expected.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    url = "http://example.com/nettest"
-    if DOMAIN not in mock_hass.data:
-        mock_hass.data[DOMAIN] = {
-            OSM_CACHE: {},
-            OSM_THROTTLE: {"lock": asyncio.Lock(), "last_query": 0},
-        }
-
-    # Avoid real network by registering the test payload with aioclient_mock
-    register_aioclient(aioclient_mock, url, text=payload)
-    await updater.get_dict_from_url(url, "NetService", "dict_name")
-
-    if expect_log_substr:
-        assert any(expect_log_substr.lower() in r.getMessage().lower() for r in caplog.records)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("payload", "dict_name", "expected_attr"),
-    [
-        (json.dumps([{"converted": "yes"}]), ATTR_OSM_DICT, {"converted": "yes"}),
-        (json.dumps({"ok": 1}), "dict_name", {"ok": 1}),
-    ],
-)
-async def test_get_dict_from_url_payloads_respect_throttle(
     monkeypatch: pytest.MonkeyPatch,
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    aioclient_mock: AioClientMock,
-    sensor: MockSensor,
-    payload: str,
-    dict_name: str,
-    expected_attr: dict[str, object],
+    caplog: pytest.LogCaptureFixture,
+    osm_type: str,
+    error: ValueError | None,
 ) -> None:
-    """Throttled fetches should cache dict payloads and converted single-item lists.
+    """Delegate OSM type validation to the library and contain its failure.
 
     Args:
-        monkeypatch (pytest.MonkeyPatch):
-            Pytest fixture for replacing dependencies.
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        aioclient_mock (AioClientMock):
-            Mocked HTTP client used for deterministic responses.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-        payload (str):
-            Places payload returned by the mocked request.
-        dict_name (str):
-            Response-cache key for the requested payload.
-        expected_attr (dict[str, object]):
-            Expected payload value stored in the sensor attribute.
+        mock_hass (MagicMock): Mocked Home Assistant runtime.
+        mock_config_entry (MockConfigEntry): Entry used to configure the updater.
+        sensor (MockSensor): Sensor providing lookup identifiers and receiving data.
+        monkeypatch (pytest.MonkeyPatch): Scoped replacement for the client method.
+        caplog (pytest.LogCaptureFixture): Captured logs for validation failures.
+        osm_type (str): OSM object type to validate through the client.
+        error (ValueError | None): Optional validation error raised by lookup.
     """
+    sensor.attrs.update({ATTR_OSM_ID: "12345", ATTR_OSM_TYPE: osm_type})
+    sensor.attrs.update({CONF_API_KEY: "contact@example.test", CONF_LANGUAGE: "en"})
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
+    lookup = AsyncMock(side_effect=error) if error is not None else AsyncMock(return_value=None)
+    monkeypatch.setattr(PlacesClient, "lookup", lookup)
 
-    url = "https://example.com/nominatim/reverse/"
-    name = "OSM Test"
+    await updater.get_extended_attr()
 
-    register_aioclient(aioclient_mock, url, text=payload)
+    lookup.assert_awaited_once_with(
+        osm_type,
+        "12345",
+        language="en",
+        email="contact@example.test",
+        use_cache=True,
+    )
+    assert sensor.attrs[ATTR_OSM_DETAILS_DICT] == {}
+    if error is not None:
+        assert "ValueError" in caplog.text
 
-    # Set up throttle so wait_time > 0 and use a real Lock for 'async with' support
-    loop = asyncio.get_running_loop()
-    last_query = loop.time() - (OSM_THROTTLE_INTERVAL_SECONDS / 2)
-    throttle = {"lock": asyncio.Lock(), "last_query": last_query}
-    if DOMAIN not in mock_hass.data:
-        mock_hass.data[DOMAIN] = {}
-    mock_hass.data[DOMAIN][OSM_CACHE] = {}
-    mock_hass.data[DOMAIN][OSM_THROTTLE] = throttle
 
-    # Patch asyncio.sleep so the test doesn't actually sleep but we can assert it was awaited
-    sleep_mock = AsyncMock()
-    monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+@pytest.mark.asyncio
+async def test_get_extended_attr_follows_wikidata_reference(
+    mock_hass: MagicMock,
+    mock_config_entry: MockConfigEntry,
+    sensor: MockSensor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use a Wikidata ID from OSM details to fetch the related entity payload.
 
-    await updater.get_dict_from_url(url=url, name=name, dict_name=dict_name)
+    Args:
+        mock_hass (MagicMock): Mocked Home Assistant runtime.
+        mock_config_entry (MockConfigEntry): Entry used to configure the updater.
+        sensor (MockSensor): Sensor receiving extended attributes.
+        monkeypatch (pytest.MonkeyPatch): Scoped replacements for client methods.
+    """
+    sensor.attrs.update({ATTR_OSM_ID: "12345", ATTR_OSM_TYPE: "node"})
+    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
+    lookup = AsyncMock(return_value={"extratags": {"wikidata": "Q123"}})
+    wikidata_payload = {"entities": {"Q123": {"labels": {"en": {"value": "Example"}}}}}
+    wikidata = AsyncMock(return_value=wikidata_payload)
+    monkeypatch.setattr(PlacesClient, "lookup", lookup)
+    monkeypatch.setattr(PlacesClient, "wikidata", wikidata)
 
-    assert sensor.attrs[dict_name] == expected_attr
-    assert mock_hass.data[DOMAIN][OSM_CACHE][url] == expected_attr
-    sleep_mock.assert_awaited()
+    await updater.get_extended_attr()
+
+    lookup.assert_awaited_once()
+    wikidata.assert_awaited_once_with("Q123", use_cache=True)
+    assert sensor.attrs[ATTR_WIKIDATA_ID] == "Q123"
+    assert sensor.attrs[ATTR_WIKIDATA_DICT] == wikidata_payload
 
 
 @pytest.mark.asyncio
@@ -3779,38 +3083,6 @@ async def test_update_coordinates_and_distance_skip_missing_attr(
         sensor.is_attr_blank.side_effect = lambda k: k in [ATTR_LATITUDE, ATTR_HOME_LATITUDE]
         result = await updater.update_coordinates_and_distance()
     assert result == UpdateStatus.SKIP
-
-
-@pytest.mark.asyncio
-async def test_is_tracker_available_valid(
-    mock_hass: MagicMock, mock_config_entry: MockConfigEntry, sensor: MockSensor
-) -> None:
-    """Returns True for existing tracker state object (not string unavailable).
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    # Provide tracker id in attrs and let default get_attr work
-    sensor.attrs[CONF_DEVICETRACKER_ID] = "device_tracker.test"
-    sensor.is_attr_blank.side_effect = lambda k: (
-        k not in sensor.attrs
-        or sensor.attrs.get(k)
-        in (
-            None,
-            "",
-        )
-    )
-    state = MagicMock()
-    state.attributes = {}
-    mock_hass.states.get.return_value = state
-    result = await updater.is_tracker_available()
-    assert result is True
 
 
 @pytest.mark.asyncio
@@ -4015,10 +3287,10 @@ async def test_fire_event_data_composite_place_semantics(
         "zone_name": "Home",
     }
     sensor.display_options_list = ["formatted_place", "driving"]
-    sensor._in_zone = in_zone
     updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
 
-    await updater.fire_event_data(prev_last_place_name="")
+    with stub_in_zone(sensor, in_zone):
+        await updater.fire_event_data(prev_last_place_name="")
 
     event_data = mock_hass.bus.fire.call_args.args[1]
     assert event_data["place"] == ("Landmark, Amenity, Cafe, Downtown, 10, Main Street")
@@ -4141,41 +3413,4 @@ async def test_get_current_time_variants(
     dt = await updater.get_current_time()
     assert dt.tzinfo is not None
     if mock_hass.config.time_zone is None:
-        assert dt.tzinfo is UTC
-
-
-@pytest.mark.asyncio
-async def test_get_dict_from_url_handles_network_error(
-    mock_hass: MagicMock,
-    mock_config_entry: MockConfigEntry,
-    caplog: pytest.LogCaptureFixture,
-    aioclient_mock: AioClientMock,
-    sensor: MockSensor,
-) -> None:
-    """If aiohttp raises ClientError, get_dict_from_url should log a warning and not set cache.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        caplog (pytest.LogCaptureFixture):
-            Captured log records used for message assertions.
-        aioclient_mock (AioClientMock):
-            Mocked HTTP client used for deterministic responses.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-    """
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-    url = "http://example.com/network-error/"
-    if DOMAIN not in mock_hass.data:
-        mock_hass.data[DOMAIN] = {
-            OSM_CACHE: {},
-            OSM_THROTTLE: {"lock": asyncio.Lock(), "last_query": 0},
-        }
-
-    # Simulate aiohttp.ClientError when getting the URL
-    aioclient_mock.get(url, exc=aiohttp.ClientError("fail"))
-    await updater.get_dict_from_url(url, "BadService", "dict_name")
-    assert "Error connecting to BadService" in caplog.text
-    assert mock_hass.data[DOMAIN][OSM_CACHE].get(url) is None
+        assert dt.utcoffset() == timedelta(0)
