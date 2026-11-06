@@ -5,6 +5,7 @@ from collections.abc import Callable, Iterator, MutableMapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, suppress
 from unittest.mock import AsyncMock, MagicMock, Mock
 
+import aiohttp
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 import homeassistant.helpers.entity_registry as er
@@ -400,6 +401,27 @@ def mock_hass() -> MagicMock:
     return hass_instance
 
 
+@pytest.fixture(autouse=True)
+def mock_places_client_session(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Give MagicMock-based HA fixtures a session accepted by PlacesClient.
+
+    The integration tests replace PlacesClient methods when they need to model
+    lookup responses. The session double is only used to construct the shared
+    client and intentionally satisfies its concrete aiohttp session boundary.
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): Scoped replacement for the session getter.
+
+    Returns:
+        MagicMock: aiohttp-compatible session double used by the fixtures.
+    """
+    session = MagicMock(spec=aiohttp.ClientSession)
+    monkeypatch.setattr(
+        "custom_components.places.helpers.async_get_clientsession", MagicMock(return_value=session)
+    )
+    return session
+
+
 @pytest.fixture
 def mock_config_entry() -> MockConfigEntry:
     """Provide a default Places config entry for unit tests.
@@ -720,7 +742,7 @@ def stub_method(
             Context manager that yields the configured method double.
 
     Usage:
-        with stub_method(parser, "parse_type", return_value=None):
+        with stub_method(parser, "parse_osm_dict", return_value=None):
             await parser.parse_osm_dict()
     """
     # Create the appropriate mock object and assign it to the target attribute.
@@ -848,7 +870,7 @@ def stubbed_parser(
             Context manager that yields parser method names mapped to their mocks.
 
     Usage:
-        with stubbed_parser(parser, [("parse_type", {}), ("set_attribution", {})]):
+        with stubbed_parser(parser, [("set_place_name_no_dupe", {})]):
             await parser.parse_osm_dict()
     """
     cms = [stub_method(parser, method_name, **kwargs) for method_name, kwargs in methods]

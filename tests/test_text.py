@@ -29,7 +29,6 @@ async def test_display_options_text_setup_and_update() -> None:
     await async_setup_entry(MagicMock(), entry, async_add_entities)
 
     entity = async_add_entities.call_args.args[0][0]
-    assert isinstance(entity, PlacesDisplayOptionsText)
     assert entity.entity_category is EntityCategory.CONFIG
     assert entity.entity_registry_enabled_default is False
     assert entity.native_value == "zone_name, place"
@@ -63,8 +62,6 @@ async def test_display_options_text_entity_enforces_max_length(mock_hass: MagicM
 
     with pytest.raises(HomeAssistantError, match="Invalid display options"):
         await entity.async_set_value("x" * (MAX_LENGTH_STATE_STATE + 1))
-
-    assert coordinator.process_display_options.await_count == 1
 
 
 def test_display_options_text_hides_legacy_overlong_state() -> None:

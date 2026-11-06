@@ -1,0 +1,363 @@
+"""Update aioplaces dependency pins in manifest and pyproject files."""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+import json
+from pathlib import Path
+import re
+import sys
+import tomllib
+from urllib.request import urlopen
+
+PYPI_URL = "https://pypi.org/pypi/aioplaces/json"
+PIN_PREFIX = "aioplaces=="
+TOML_PIN_RE = re.compile(r'(?m)^(\s*)"aioplaces==[^"]+"(,?)\s*$')
+PRERELEASE_RE = re.compile(r"(?i)(?:[.\-_]?(?:a|alpha|b|beta|c|pre|preview|rc|dev)\d*)")
+
+
+@dataclass(frozen=True)
+class UpdateResult:
+    """Result of evaluating aioplaces dependency pins.
+
+    Attributes:
+        current: Current manifest aioplaces pin version.
+        pyproject_current: Current pyproject aioplaces pin version.
+        latest: aioplaces version selected as the update target.
+        update_needed: Whether at least one pin should be updated.
+    """
+
+    current: str
+    pyproject_current: str
+    latest: str
+    update_needed: bool
+
+
+def _version_key(version: str) -> tuple[tuple[int, int | str], ...]:
+    """Return a tolerant comparison key for aioplaces version strings.
+
+    Args:
+        version (str): Version string to normalize.
+
+    Returns:
+        Tuple suitable for comparing common dotted release versions.
+    """
+    parts = re.findall(r"\d+|[A-Za-z]+", version.lstrip("vV"))
+    return tuple((0, int(part)) if part.isdigit() else (1, part.lower()) for part in parts)
+
+
+def _latest_is_newer(current: str, latest: str) -> bool:
+    """Return whether the latest version is newer than the current version.
+
+    Args:
+        current (str): Current pinned version.
+        latest (str): Latest available version.
+
+    Returns:
+        True when latest sorts after current.
+    """
+    if _is_prerelease(latest):
+        return False
+    if _is_prerelease(current):
+        return _version_key(latest) >= _stable_version_key(current)
+    return _version_key(latest) > _version_key(current)
+
+
+def _stable_version_key(version: str) -> tuple[tuple[int, int | str], ...]:
+    """Return a comparison key for the stable part of a version string.
+
+    Args:
+        version (str): Version string to normalize.
+
+    Returns:
+        Tuple suitable for comparing the stable release version.
+    """
+    match = PRERELEASE_RE.search(version)
+    stable_version = version[: match.start()].rstrip(".-_") if match else version
+    return _version_key(stable_version)
+
+
+def _is_prerelease(version: str) -> bool:
+    """Return whether a version string appears to be a prerelease.
+
+    Args:
+        version (str): Version string to evaluate.
+
+    Returns:
+        True when the version has a common prerelease marker.
+    """
+    return PRERELEASE_RE.search(version) is not None
+
+
+def fetch_latest_version() -> str:
+    """Fetch the latest stable aioplaces version from PyPI.
+
+    Returns:
+        Latest stable version string.
+
+    Raises:
+        ValueError: If PyPI does not return a usable version.
+    """
+    with urlopen(PYPI_URL, timeout=30) as response:
+        payload = json.load(response)
+
+    return _select_latest_stable_version(payload)
+
+
+def _select_latest_stable_version(payload: Mapping[str, object]) -> str:
+    """Select the newest stable version from a PyPI JSON payload.
+
+    Args:
+        payload (Mapping[str, object]): PyPI JSON response payload.
+
+    Returns:
+        Newest non-prerelease version from the release list.
+
+    Raises:
+        ValueError: If PyPI does not return any stable versions.
+    """
+    releases = payload.get("releases", {})
+    if not isinstance(releases, dict):
+        raise TypeError("Expected releases mapping in PyPI response")
+
+    stable_versions = [
+        version
+        for version, files in releases.items()
+        if (
+            isinstance(version, str)
+            and not _is_prerelease(version)
+            and _release_has_usable_file(files)
+        )
+    ]
+    if not stable_versions:
+        raise ValueError("Unable to determine latest stable aioplaces version from PyPI response")
+    return max(stable_versions, key=_version_key)
+
+
+def _release_has_usable_file(files: object) -> bool:
+    """Return whether a PyPI release has at least one non-yanked file.
+
+    Args:
+        files (object): Release file list from a PyPI JSON response.
+
+    Returns:
+        True when at least one file can be installed.
+    """
+    if not isinstance(files, list):
+        return False
+    return any(isinstance(file, dict) and file.get("yanked") is not True for file in files)
+
+
+def _read_manifest_version(manifest_path: Path) -> str:
+    """Read the aioplaces pin version from a Home Assistant manifest.
+
+    Args:
+        manifest_path (Path): Path to the integration manifest.
+
+    Returns:
+        Current aioplaces version.
+
+    Raises:
+        ValueError: If there is not exactly one pinned aioplaces requirement.
+    """
+    manifest = json.loads(manifest_path.read_text())
+    requirements = manifest.get("requirements", [])
+    if not isinstance(requirements, list):
+        raise TypeError(f"Expected requirements list in {manifest_path}")
+
+    pins = [requirement for requirement in requirements if _is_aioplaces_pin(requirement)]
+    if len(pins) != 1:
+        raise ValueError(
+            f"Expected exactly one aioplaces requirement in {manifest_path}; found {len(pins)}"
+        )
+    return pins[0].removeprefix(PIN_PREFIX)
+
+
+def _read_pyproject_version(pyproject_path: Path) -> str:
+    """Read the aioplaces pin version from project dependencies in pyproject.
+
+    Args:
+        pyproject_path (Path): Path to pyproject.toml.
+
+    Returns:
+        Current aioplaces version.
+
+    Raises:
+        ValueError: If there is not exactly one pinned aioplaces dependency.
+    """
+    pyproject = tomllib.loads(pyproject_path.read_text())
+    project = pyproject.get("project", {})
+    if not isinstance(project, dict):
+        raise TypeError(f"Expected project table in {pyproject_path}")
+    dependencies = project.get("dependencies", [])
+    if not isinstance(dependencies, list):
+        raise TypeError(f"Expected project.dependencies list in {pyproject_path}")
+    pins = [dependency for dependency in dependencies if _is_aioplaces_pin(dependency)]
+
+    if len(pins) != 1:
+        raise ValueError(
+            f"Expected exactly one pinned aioplaces dependency in {pyproject_path}; "
+            f"found {len(pins)}"
+        )
+    return pins[0].removeprefix(PIN_PREFIX)
+
+
+def _is_aioplaces_pin(requirement: object) -> bool:
+    """Return whether a dependency entry is an aioplaces exact pin.
+
+    Args:
+        requirement (object): Dependency entry read from JSON or TOML.
+
+    Returns:
+        True when the entry is an exact aioplaces pin.
+    """
+    return isinstance(requirement, str) and requirement.startswith(PIN_PREFIX)
+
+
+def _write_manifest_version(manifest_path: Path, latest_version: str) -> None:
+    """Write the aioplaces pin version into the manifest.
+
+    Args:
+        manifest_path (Path): Path to the integration manifest.
+        latest_version (str): Version to pin.
+
+    Raises:
+        ValueError: If there is not exactly one pinned aioplaces requirement.
+    """
+    manifest = json.loads(manifest_path.read_text())
+    requirements = manifest.get("requirements", [])
+    if not isinstance(requirements, list):
+        raise TypeError(f"Expected requirements list in {manifest_path}")
+
+    updated_count = 0
+    updated_requirements: list[object] = []
+    for requirement in requirements:
+        if _is_aioplaces_pin(requirement):
+            updated_count += 1
+            updated_requirements.append(f"{PIN_PREFIX}{latest_version}")
+        else:
+            updated_requirements.append(requirement)
+
+    if updated_count != 1:
+        raise ValueError(
+            f"Expected to update exactly one aioplaces requirement in {manifest_path}; "
+            f"updated {updated_count}"
+        )
+
+    manifest["requirements"] = updated_requirements
+    manifest_path.write_text(f"{json.dumps(manifest, indent=2)}\n")
+
+
+def _write_pyproject_version(pyproject_path: Path, latest_version: str) -> None:
+    """Write the aioplaces pin version into pyproject while preserving layout.
+
+    Args:
+        pyproject_path (Path): Path to pyproject.toml.
+        latest_version (str): Version to pin.
+
+    Raises:
+        ValueError: If there is not exactly one pinned aioplaces dependency line.
+    """
+    text = pyproject_path.read_text()
+    updated, count = TOML_PIN_RE.subn(rf'\1"{PIN_PREFIX}{latest_version}"\2', text)
+    if count != 1:
+        raise ValueError(
+            f"Expected to update exactly one aioplaces pin in {pyproject_path}; updated {count}"
+        )
+    pyproject_path.write_text(updated)
+
+
+def update_pins(
+    *,
+    manifest_path: Path,
+    pyproject_path: Path,
+    latest_version: str,
+    write: bool = True,
+) -> UpdateResult:
+    """Evaluate and optionally update aioplaces dependency pins.
+
+    Args:
+        manifest_path (Path): Path to manifest.json.
+        pyproject_path (Path): Path to pyproject.toml.
+        latest_version (str): Latest aioplaces version available for evaluation.
+        write (bool): Whether to rewrite dependency files when an update is needed.
+
+    Returns:
+        Evaluation result for workflow outputs and tests.
+    """
+    current = _read_manifest_version(manifest_path)
+    pyproject_current = _read_pyproject_version(pyproject_path)
+    latest_is_newer = _latest_is_newer(current, latest_version)
+    target_version = latest_version if latest_is_newer else current
+    update_needed = latest_is_newer or pyproject_current != target_version
+
+    if write and update_needed:
+        _write_manifest_version(manifest_path, target_version)
+        _write_pyproject_version(pyproject_path, target_version)
+
+    return UpdateResult(
+        current=current,
+        pyproject_current=pyproject_current,
+        latest=target_version,
+        update_needed=update_needed,
+    )
+
+
+def _write_github_outputs(result: UpdateResult, output_path: Path) -> None:
+    """Append update result values to the GitHub Actions output file.
+
+    Args:
+        result (UpdateResult): Update result to write.
+        output_path (Path): Path from the GITHUB_OUTPUT environment variable.
+    """
+    with output_path.open("a") as output_file:
+        output_file.write(f"current={result.current}\n")
+        output_file.write(f"pyproject_current={result.pyproject_current}\n")
+        output_file.write(f"latest={result.latest}\n")
+        output_file.write(f"update_needed={str(result.update_needed).lower()}\n")
+
+
+def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    """Parse command-line arguments.
+
+    Args:
+        argv (Sequence[str]): Command-line arguments excluding the executable name.
+
+    Returns:
+        Parsed arguments.
+    """
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--manifest-path", type=Path, required=True)
+    parser.add_argument("--pyproject-path", type=Path, required=True)
+    parser.add_argument("--latest-version")
+    parser.add_argument("--write", action="store_true")
+    parser.add_argument("--github-output", type=Path)
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the aioplaces dependency pin updater.
+
+    Args:
+        argv (Sequence[str] | None): Optional command-line arguments excluding the executable name.
+
+    Returns:
+        Process exit code.
+    """
+    args = _parse_args(sys.argv[1:] if argv is None else argv)
+    latest_version = args.latest_version or fetch_latest_version()
+    result = update_pins(
+        manifest_path=args.manifest_path,
+        pyproject_path=args.pyproject_path,
+        latest_version=latest_version,
+        write=args.write,
+    )
+    if args.github_output is not None:
+        _write_github_outputs(result, args.github_output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
