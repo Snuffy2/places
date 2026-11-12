@@ -61,13 +61,14 @@ def test_places_attribute_blank_semantics(mock_hass: MagicMock) -> None:
     assert coordinator.is_attr_blank("text_value") is False
 
 
-def test_places_attributes_preserves_empty_initial_mapping() -> None:
-    """An explicit empty initial mapping remains the backing storage object."""
+def test_places_attributes_updates_initial_mapping() -> None:
+    """Mutations through the container remain visible in the supplied mapping."""
     initial: MutableMapping[str, object] = {}
 
     attributes = PlacesAttributes(initial)
+    attributes.set("place_name", "Central Park")
 
-    assert attributes.data is initial
+    assert initial == {"place_name": "Central Park"}
 
 
 def test_places_attribute_safe_conversions(mock_hass: MagicMock) -> None:
@@ -119,7 +120,7 @@ async def test_places_attribute_cleanup_and_restore(mock_hass: MagicMock) -> Non
 
 
 async def test_places_attribute_restore_previous_attr(mock_hass: MagicMock) -> None:
-    """Rollback restores the exact previous mapping object and content.
+    """Rollback restores prior attributes and the published native value.
 
     Args:
         mock_hass (MagicMock):
@@ -133,8 +134,8 @@ async def test_places_attribute_restore_previous_attr(mock_hass: MagicMock) -> N
 
     await coordinator.restore_previous_attr(previous)
 
-    assert coordinator.get_internal_attr() is previous
     assert coordinator.get_internal_attr() == previous
+    assert coordinator.snapshot().native_value == "Old State"
 
 
 @pytest.mark.parametrize(

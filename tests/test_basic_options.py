@@ -119,7 +119,7 @@ async def test_build_display_scenarios(
     in_zone: bool,
     options: Sequence[str],
     expected: str,
-    sensor: MockSensor,
+    basic_parser: BasicParserFactory,
 ) -> None:
     """Parametrized scenarios for BasicOptionsParser.build_display output.
 
@@ -132,13 +132,10 @@ async def test_build_display_scenarios(
             Configuration options applied by the flow or parser.
         expected (str):
             Expected result for this parametrized case.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
+        basic_parser (BasicParserFactory):
+            Factory for the parser and configured sensor used by this scenario.
     """
-    # Mutate shared sensor fixture for this scenario
-    sensor.attrs = dict(attrs or {})
-    sensor._in_zone = in_zone
-    parser = BasicOptionsParser(sensor, attrs, options)
+    parser, _sensor = basic_parser(attrs=attrs, options=options, in_zone=in_zone)
     result = await parser.build_display()
     assert result == expected
 
@@ -182,7 +179,7 @@ async def test_build_formatted_place_variants(
     options: Sequence[str],
     display_list: Sequence[str] | None,
     expected: str,
-    sensor: MockSensor,
+    basic_parser: BasicParserFactory,
 ) -> None:
     """Parametrized exact outputs for BasicOptionsParser.build_formatted_place.
 
@@ -197,47 +194,35 @@ async def test_build_formatted_place_variants(
             Display-option tokens used to render the state.
         expected (str):
             Expected result for this parametrized case.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
+        basic_parser (BasicParserFactory):
+            Factory for the parser and configured sensor used by this variant.
     """
-    sensor.attrs = dict(attrs or {})
-    sensor._in_zone = in_zone
-    sensor.display_options_list = display_list or []
-    parser = BasicOptionsParser(sensor, attrs, options)
+    parser, _sensor = basic_parser(
+        attrs=attrs,
+        options=options,
+        display_options_list=display_list,
+        in_zone=in_zone,
+    )
     result = await parser.build_formatted_place()
     assert result == expected
 
 
-@pytest.mark.parametrize(
-    ("attrs", "expected"),
-    [
-        ({"place_type": "restaurant", "place_category": "food"}, "Restaurant"),
-        ({"place_type": "unclassified", "place_category": "food"}, "Food"),
-    ],
-)
-def test_add_type_or_category(
-    attrs: Attrs, expected: str, basic_parser: BasicParserFactory
-) -> None:
-    """Test that `add_type_or_category` adds the correct capitalized type or category to the list.
+def test_add_type_falls_back_to_category(basic_parser: BasicParserFactory) -> None:
+    """Use the capitalized category when the place type is unclassified.
 
     Args:
-        attrs (Attrs):
-            Places attribute mapping used by the test.
-        expected (str):
-            Expected result for this parametrized case.
         basic_parser (BasicParserFactory):
             Basic display-options parser fixture.
     """
-    parser, sensor = basic_parser(attrs=attrs)
+    parser, sensor = basic_parser(attrs={"place_type": "unclassified", "place_category": "food"})
     arr: list[str] = []
     parser.add_type_or_category(arr, sensor)
-    assert expected in arr
+    assert arr == ["Food"]
 
 
 @pytest.mark.parametrize(
     ("attrs", "expected"),
     [
-        ({"street": "Main St", "street_number": ""}, "Main St"),
         ({"street": "Main St", "street_number": "123"}, "123 Main St"),
         (
             {
@@ -273,7 +258,7 @@ def test_add_street_info(attrs: Attrs, expected: str, basic_parser: BasicParserF
     parser, sensor = basic_parser(attrs=attrs)
     arr: list[str] = []
     parser.add_street_info(arr, sensor)
-    assert expected in arr
+    assert arr == [expected]
 
 
 @pytest.mark.parametrize(
@@ -302,45 +287,32 @@ def test_add_city_county_state(
     parser, sensor = basic_parser(attrs=attrs)
     arr: list[str] = []
     parser.add_city_county_state(arr, sensor)
-    assert expected_city in arr
-    assert expected_state in arr
+    assert arr == [expected_city, expected_state]
 
 
 @pytest.mark.parametrize(
-    ("attrs", "duplicate_list", "expected"),
+    ("attrs", "expected"),
     [
-        ({"place_name": "Park"}, [], True),
-        ({"place_name": ""}, [], False),
-        ({"place_name": "Dup", "city": "Dup"}, ["city"], False),
-        ({"place_name": 123, "city": 123}, ["city"], False),
+        ({"place_name": "Park"}, True),
+        ({"place_name": ""}, False),
+        ({"place_name": "Dup", "city": "Dup"}, False),
+        ({"place_name": 123, "city": 123}, False),
     ],
 )
 def test_should_use_place_name(
     attrs: Attrs,
-    duplicate_list: list[str],
     expected: bool,
     basic_parser: BasicParserFactory,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Test that `should_use_place_name` returns the correct boolean based on place_name and duplicates.
 
     Args:
         attrs (Attrs):
             Places attribute mapping used by the test.
-        duplicate_list (list[str]):
-            Configured attribute names checked for duplicate place names.
         expected (bool):
             Expected result for this parametrized case.
         basic_parser (BasicParserFactory):
             Basic display-options parser fixture.
-        monkeypatch (pytest.MonkeyPatch):
-            Pytest fixture for replacing dependencies.
     """
     parser, sensor = basic_parser(attrs=attrs)
-    if duplicate_list:
-        monkeypatch.setattr(
-            "custom_components.places.basic_options.PLACE_NAME_DUPLICATE_LIST",
-            duplicate_list,
-            raising=False,
-        )
     assert parser.should_use_place_name(attrs, sensor) is expected

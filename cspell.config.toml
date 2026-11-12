@@ -11,6 +11,7 @@ import = [
 
 words = [
     "aiohttp",
+    "aioplaces",
     "automations",
     "conftest",
     "devicetracker",
@@ -22,6 +23,7 @@ words = [
     "licence",
     "mypy",
     "neighbourhood",
+    "Nominatim",
     "nbsp",
     "parameterizing",
     "prek",

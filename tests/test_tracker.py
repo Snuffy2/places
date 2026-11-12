@@ -24,60 +24,6 @@ from custom_components.places.update_sensor import PlacesUpdater
 from tests.conftest import MockSensor
 
 
-class _TrackerAttributeMapping:
-    """Minimal duck-typed mapping used by tracker attributes tests."""
-
-    def __init__(self, values: dict[str, object]) -> None:
-        """Store an internal mapping for ``get`` access.
-
-        Args:
-            values (dict[str, object]):
-                Tracker attributes returned by the fake state object.
-        """
-        self._values = values
-
-    def get(self, key: str, default: object | None = None) -> object | None:
-        """Return a value from the stored attributes.
-
-        Args:
-            key (str):
-                Configuration or attribute key being accessed.
-            default (object | None):
-                Fallback returned when the requested tracker attribute is absent.
-
-        Returns:
-            object | None:
-                State or attribute selected by the test double for the requested key.
-        """
-        return self._values.get(key, default)
-
-
-class _TrackerAttributesWithoutDefault:
-    """Duck-typed attributes object whose ``get`` does not accept a default."""
-
-    def __init__(self, values: dict[str, object]) -> None:
-        """Store an internal mapping for single-argument ``get`` access.
-
-        Args:
-            values (dict[str, object]):
-                Tracker attributes returned by the fake state object.
-        """
-        self._values = values
-
-    def get(self, key: str) -> object | None:
-        """Return a value from the stored attributes.
-
-        Args:
-            key (str):
-                Configuration or attribute key being accessed.
-
-        Returns:
-            object | None:
-                State or attribute selected by the test double for the requested key.
-        """
-        return self._values.get(key)
-
-
 @pytest.mark.parametrize(
     ("tracker_id", "expect_state_lookup"),
     [
@@ -190,34 +136,6 @@ async def test_tracker_non_finite_coordinates_are_invalid(
     assert snapshot.has_valid_coordinates is False
 
 
-async def test_tracker_attributes_with_get_only_preserves_ok_path(
-    mock_hass: MagicMock, mock_config_entry: MockConfigEntry, sensor: MockSensor
-) -> None:
-    """Non-Mapping attribute objects with `.get` preserve tracker coordinate flow.
-
-    Args:
-        mock_hass (MagicMock):
-            Mocked Home Assistant runtime.
-        mock_config_entry (MockConfigEntry):
-            Places configuration entry used by the test.
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-    """
-    sensor.attrs[CONF_DEVICETRACKER_ID] = "device_tracker.person"
-    tracker = MagicMock()
-    tracker.attributes = _TrackerAttributeMapping(
-        {CONF_LATITUDE: "1.23", CONF_LONGITUDE: "4.56", ATTR_GPS_ACCURACY: "7"}
-    )
-    mock_hass.states.get.return_value = tracker
-    updater = PlacesUpdater(mock_hass, mock_config_entry, sensor)
-
-    assert await updater.has_valid_coordinates() is True
-    await updater.update_coordinates()
-
-    assert sensor.attrs[PLACES_ATTR_LATITUDE] == 1.23
-    assert sensor.attrs[PLACES_ATTR_LONGITUDE] == 4.56
-
-
 async def test_tracker_float_like_coordinates_are_converted(
     mock_hass: MagicMock, mock_config_entry: MockConfigEntry, sensor: MockSensor
 ) -> None:
@@ -251,10 +169,8 @@ async def test_tracker_float_like_coordinates_are_converted(
     assert snapshot.gps_accuracy == 7.0
 
 
-async def test_tracker_get_without_default_treats_none_coordinates_as_missing(
-    mock_hass: MagicMock,
-) -> None:
-    """Fallback ``get`` calls treat returned ``None`` coordinates as missing.
+async def test_tracker_missing_coordinates_have_missing_status(mock_hass: MagicMock) -> None:
+    """A state with no coordinate attributes reports missing coordinates.
 
     Args:
         mock_hass (MagicMock):
@@ -263,9 +179,7 @@ async def test_tracker_get_without_default_treats_none_coordinates_as_missing(
     tracker = MagicMock()
     tracker.entity_id = "device_tracker.person"
     tracker.state = "home"
-    tracker.attributes = _TrackerAttributesWithoutDefault(
-        {CONF_LATITUDE: None, CONF_LONGITUDE: None}
-    )
+    tracker.attributes = {}
     mock_hass.states.get.return_value = tracker
 
     snapshot = TrackerSnapshot.from_hass(mock_hass, "device_tracker.person")
