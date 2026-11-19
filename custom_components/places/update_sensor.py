@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import MutableMapping
+from collections.abc import Awaitable, MutableMapping
 from datetime import UTC, datetime
 import logging
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
+from aioplaces import JSONMapping, PlacesError
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     ATTR_FRIENDLY_NAME,
@@ -68,13 +69,11 @@ from .const import (
     DOMAIN,
     EVENT_ATTRIBUTE_MAP,
     EVENT_TYPE,
-    OSM_CACHE,
     RESET_ATTRIBUTE_LIST,
     UpdateStatus,
 )
-from .helpers import clear_since_from_state, is_float, safe_truncate
+from .helpers import _ensure_places_client, clear_since_from_state, is_float, safe_truncate
 from .location import CoordinatePair, LocationSnapshot, direction_of_travel
-from .osm_client import OSMClient
 from .parse_osm import OSMParser
 from .tracker import TrackerSnapshot, TrackerStatus
 
@@ -106,10 +105,7 @@ class PlacesUpdater:
         self.coordinator = coordinator
         self._config_entry: ConfigEntry = config_entry
         self._hass = hass
-        self._osm_client = OSMClient(
-            hass=hass,
-            sensor_name=str(self.coordinator.get_attr(CONF_NAME)),
-        )
+        self._places_client = _ensure_places_client(hass)
         self._use_cache = True
 
     async def do_update(
@@ -147,7 +143,6 @@ class PlacesUpdater:
 
         try:
             await self.update_entity_name_and_cleanup()
-            self._osm_client.update_sensor_name(str(coordinator.get_attr(CONF_NAME)))
             await self.update_previous_state()
             await self.update_old_coordinates()
             prev_last_place_name = coordinator.get_attr_safe_str(ATTR_LAST_PLACE_NAME)
@@ -772,8 +767,17 @@ class PlacesUpdater:
             now (datetime):
                 Update timestamp to store when OSM returned usable data.
         """
-        osm_url: str = await self.build_osm_url()
-        await self.get_dict_from_url(url=osm_url, name="OpenStreetMaps", dict_name=ATTR_OSM_DICT)
+        await self._get_place_data(
+            self._places_client.reverse(
+                self.coordinator.get_attr_safe_float(ATTR_LATITUDE),
+                self.coordinator.get_attr_safe_float(ATTR_LONGITUDE),
+                language=self.coordinator.get_attr_safe_str(CONF_LANGUAGE),
+                email=self.coordinator.get_attr_safe_str(CONF_API_KEY),
+                use_cache=self._use_cache,
+            ),
+            name="OpenStreetMap",
+            dict_name=ATTR_OSM_DICT,
+        )
         if not self.coordinator.is_attr_blank(ATTR_OSM_DICT):
             parser = OSMParser(coordinator=self.coordinator)
             await parser.parse_osm_dict()
@@ -871,107 +875,58 @@ class PlacesUpdater:
         ):
             await self.change_show_time_to_date()
 
-    async def build_osm_url(self) -> str:
-        """Build the Nominatim reverse-geocode URL for current coordinates.
-
-        Returns:
-            str:
-                Fully encoded Nominatim reverse lookup URL.
-        """
-        return OSMClient.reverse_url(
-            self.coordinator.get_attr_safe_float(ATTR_LATITUDE),
-            self.coordinator.get_attr_safe_float(ATTR_LONGITUDE),
-            self.coordinator.get_attr(CONF_LANGUAGE) or "",
-            self.coordinator.get_attr(CONF_API_KEY) or "",
-        )
-
     async def get_extended_attr(self) -> None:
         """Fetch optional OSM lookup details and related Wikidata payloads."""
-        if not self.coordinator.is_attr_blank(ATTR_OSM_ID) and not self.coordinator.is_attr_blank(
+        if self.coordinator.is_attr_blank(ATTR_OSM_ID) or self.coordinator.is_attr_blank(
             ATTR_OSM_TYPE
         ):
-            if self.coordinator.get_attr_safe_str(ATTR_OSM_TYPE).lower() == "node":
-                osm_type_abbr = "N"
-            elif self.coordinator.get_attr_safe_str(ATTR_OSM_TYPE).lower() == "way":
-                osm_type_abbr = "W"
-            elif self.coordinator.get_attr_safe_str(ATTR_OSM_TYPE).lower() == "relation":
-                osm_type_abbr = "R"
-            else:
-                _LOGGER.warning(
-                    "(%s) Unknown OSM type: %s",
-                    self.coordinator.get_attr(CONF_NAME),
-                    self.coordinator.get_attr(ATTR_OSM_TYPE),
-                )
-                return
-
-            osm_details_url: str = OSMClient.details_url(
-                osm_type_abbr=osm_type_abbr,
-                osm_id=self.coordinator.get_attr(ATTR_OSM_ID),
-                language=self.coordinator.get_attr(CONF_LANGUAGE) or "",
-                email=self.coordinator.get_attr(CONF_API_KEY) or "",
+            return
+        await self._get_place_data(
+            self._places_client.lookup(
+                self.coordinator.get_attr_safe_str(ATTR_OSM_TYPE),
+                self.coordinator.get_attr_safe_str(ATTR_OSM_ID),
+                language=self.coordinator.get_attr_safe_str(CONF_LANGUAGE),
+                email=self.coordinator.get_attr_safe_str(CONF_API_KEY),
+                use_cache=self._use_cache,
+            ),
+            name="OpenStreetMap details",
+            dict_name=ATTR_OSM_DETAILS_DICT,
+        )
+        details = self.coordinator.get_attr_safe_dict(ATTR_OSM_DETAILS_DICT)
+        extras = details.get("extratags")
+        wikidata_id = extras.get("wikidata") if isinstance(extras, MutableMapping) else None
+        self.coordinator.clear_attr(ATTR_WIKIDATA_ID)
+        self.coordinator.set_attr(ATTR_WIKIDATA_DICT, {})
+        if isinstance(wikidata_id, str) and wikidata_id:
+            self.coordinator.set_attr(ATTR_WIKIDATA_ID, wikidata_id)
+            await self._get_place_data(
+                self._places_client.wikidata(wikidata_id, use_cache=self._use_cache),
+                name="Wikidata",
+                dict_name=ATTR_WIKIDATA_DICT,
             )
-            await self.get_dict_from_url(
-                url=osm_details_url,
-                name="OpenStreetMaps Details",
-                dict_name=ATTR_OSM_DETAILS_DICT,
-            )
 
-            if not self.coordinator.is_attr_blank(ATTR_OSM_DETAILS_DICT):
-                osm_details_dict = self.coordinator.get_attr_safe_dict(ATTR_OSM_DETAILS_DICT)
-                _LOGGER.debug(
-                    "(%s) OSM Details Dict: %s",
-                    self.coordinator.get_attr(CONF_NAME),
-                    osm_details_dict,
-                )
-
-                if (
-                    "extratags" in osm_details_dict
-                    and osm_details_dict.get("extratags") is not None
-                    and "wikidata" in osm_details_dict.get("extratags", {})
-                    and osm_details_dict.get("extratags", {}).get("wikidata") is not None
-                ):
-                    self.coordinator.set_attr(
-                        ATTR_WIKIDATA_ID,
-                        osm_details_dict.get("extratags", {}).get("wikidata"),
-                    )
-
-                self.coordinator.set_attr(ATTR_WIKIDATA_DICT, {})
-                if not self.coordinator.is_attr_blank(ATTR_WIKIDATA_ID):
-                    wikidata_url: str = OSMClient.wikidata_url(
-                        self.coordinator.get_attr(ATTR_WIKIDATA_ID)
-                    )
-                    await self.get_dict_from_url(
-                        url=wikidata_url,
-                        name="Wikidata",
-                        dict_name=ATTR_WIKIDATA_DICT,
-                    )
-
-    async def get_dict_from_url(self, url: str, name: str, dict_name: str) -> None:
-        """Fetch JSON with shared throttling and cache it on the HA instance.
+    async def _get_place_data(
+        self, request: Awaitable[JSONMapping | None], name: str, dict_name: str
+    ) -> None:
+        """Store a library response or an empty payload on lookup failure.
 
         Args:
-            url (str):
-                Absolute URL to request.
-            name (str):
-                Human-readable service name used in logs.
-            dict_name (str):
-                Sensor attribute that receives the parsed JSON payload.
+            request (Awaitable[JSONMapping | None]): Library lookup to await.
+            name (str): Service name for contextual logging.
+            dict_name (str): Sensor attribute receiving the response.
         """
-        get_dict = await self._osm_client.get_json(url=url, name=name, use_cache=self._use_cache)
-        self.coordinator.set_attr(dict_name, get_dict if get_dict is not None else {})
-        if get_dict is not None:
-            if not self.coordinator.is_attr_blank(dict_name):
-                return
-
-            # Empty payloads are not useful lookup results. OSMClient caches
-            # every successful response, including empty containers, so remove
-            # them even after a forced fetch that bypassed cache reads.
-            self._hass.data[DOMAIN][OSM_CACHE].pop(url, None)
-            return
-
-        if self._use_cache:
-            # Ensure no stale key survives when a normal lookup produced no payload.
-            self._hass.data[DOMAIN][OSM_CACHE].pop(url, None)
+        try:
+            payload = await request
+        except (PlacesError, ValueError) as error:
+            _LOGGER.warning(
+                "(%s) Could not fetch %s: %s: %s",
+                self.coordinator.get_attr(CONF_NAME),
+                name,
+                type(error).__name__,
+                error,
+            )
+            payload = None
+        self.coordinator.set_attr(dict_name, payload or {})
 
     async def determine_if_update_needed(self) -> UpdateStatus:
         """Decide whether movement since the last update warrants geocoding.

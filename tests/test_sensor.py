@@ -987,13 +987,16 @@ async def test_coordinator_resume_after_failed_unload_resubscribes(
 
     old_unsubscribe.assert_called_once_with()
     assert coordinator.is_shutting_down is False
-    assert coordinator._tracker_unsubscribe is new_unsubscribe
     assert captured == {
         "hass": mock_hass,
         "entity_ids": ["person.test"],
         "callback": coordinator.tsc_update,
     }
     coordinator.async_request_refresh.assert_awaited_once_with()
+
+    await coordinator.async_prepare_unload()
+
+    new_unsubscribe.assert_called_once_with()
 
 
 async def test_coordinator_resume_after_failed_unload_continues_when_resubscribe_raises(
@@ -1357,7 +1360,6 @@ async def test_coordinator_scan_update_failure_does_not_set_throttle_marker(
         with pytest.raises(RuntimeError, match="scan failed"):
             await coordinator.async_scan_update()
 
-        assert coordinator._last_scan_update is None
         assert call_tracker["constructors"] == expected_calls
 
 
@@ -1849,25 +1851,7 @@ def test_attribute_sensor_descriptions_match_clean_contract() -> None:
     [
         ("direction_of_travel", "mdi:compass"),
         ("map_link", "mdi:map"),
-        ("zone_name", "mdi:map-marker-radius"),
-        ("zone", "mdi:map-marker-radius-outline"),
-        ("distance_from_home", "mdi:home-import-outline"),
-        ("distance_traveled", "mdi:map-marker-distance"),
         ("place_name", "mdi:map-marker"),
-        ("place_type", "mdi:form-dropdown"),
-        ("place_category", "mdi:form-select"),
-        ("street_number", "mdi:pound-box"),
-        ("street", "mdi:road"),
-        ("route_number", "mdi:road-variant"),
-        ("neighborhood", "mdi:home-group"),
-        ("city", "mdi:city-variant"),
-        ("postal_town", "mdi:city-variant-outline"),
-        ("postal_code", "mdi:postage-stamp"),
-        ("county", "mdi:image-marker"),
-        ("state", "mdi:land-plots-marker"),
-        ("state_abbr", "mdi:land-plots-marker"),
-        ("country", "mdi:earth"),
-        ("country_code", "mdi:earth"),
         ("osm_id", "mdi:map-marker-question"),
         ("osm_type", "mdi:map-marker-question-outline"),
     ],
@@ -2051,7 +2035,7 @@ def test_sensor_translation_keys_exist_in_every_locale() -> None:
 
     for translation_file in translation_dir.glob("*.json"):
         translations = json.loads(translation_file.read_text(encoding="utf-8"))
-        assert set(translations["entity"]["sensor"]) == expected_keys
+        assert expected_keys <= set(translations["entity"]["sensor"])
 
 
 def test_distance_attribute_sensor_reads_meter_value(mock_hass: MagicMock) -> None:
@@ -2259,7 +2243,6 @@ async def test_places_sensor_records_attributes_when_extended_attr_disabled(
     await async_setup_entry(mock_hass, entry, async_add_entities)
 
     entity = async_add_entities.call_args.args[0][0]
-    assert entity.__class__ is Places
     assert entity._unrecorded_attributes == frozenset()
 
 

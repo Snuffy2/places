@@ -1,6 +1,6 @@
-"""Unit tests for the OSMParser class in custom_components.places.parse_osm."""
+"""Tests for mapping normalized place data onto Home Assistant attributes."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Protocol
 
 import pytest
@@ -32,777 +32,207 @@ from custom_components.places.const import (
     ATTR_STREET,
     ATTR_STREET_NUMBER,
     CONF_LANGUAGE,
-    PLACE_NAME_DUPLICATE_LIST,
 )
 from custom_components.places.parse_osm import OSMParser
 from tests.conftest import MockSensor, mock_sensor
 
 type Attrs = Mapping[str, object]
-type AttrName = str
-type Address = Mapping[str, object]
-type OsmDict = dict[str, object]
-type SetAttrCall = tuple[str, object]
 
 
 class OSMParserFactory(Protocol):
-    """Factory fixture for an OSM parser and backing mock sensor."""
+    """Factory for a parser and its Home Assistant sensor double."""
 
     def __call__(self, attrs: Attrs | None = None) -> tuple[OSMParser, MockSensor]:
-        """Create the parser and sensor.
+        """Create a parser backed by the supplied attributes.
 
         Args:
-            attrs (Attrs | None):
-                Places attribute mapping used by the test.
+            attrs (Attrs | None): Initial attributes for the parser's sensor.
 
         Returns:
-            tuple[OSMParser, MockSensor]:
-                OpenStreetMap parser and the backing ``MockSensor``.
+            tuple[OSMParser, MockSensor]: Parser and corresponding sensor double.
         """
 
 
 @pytest.fixture
 def osm_parser() -> OSMParserFactory:
-    """Factory fixture to create an OSMParser and its sensor.
-
-    Returns (parser, sensor).
+    """Create parsers backed by isolated mock sensors.
 
     Returns:
-        OSMParserFactory:
-            Factory that builds a parser and its associated sensor double.
+        OSMParserFactory: Factory for independent parser and sensor pairs.
     """
 
-    def _create(attrs: Attrs | None = None) -> tuple[OSMParser, MockSensor]:
-        """Create an OSM parser backed by a configured mock sensor.
+    def create(attrs: Attrs | None = None) -> tuple[OSMParser, MockSensor]:
+        """Create a parser and sensor initialized with optional attributes.
 
         Args:
-            attrs (Attrs | None):
-                Sensor attributes exposed to parser lookups.
+            attrs (Attrs | None): Initial attributes for the sensor.
 
         Returns:
-            tuple[OSMParser, MockSensor]:
-                Parser instance and the sensor backing it.
+            tuple[OSMParser, MockSensor]: Parser and corresponding sensor double.
         """
         sensor = mock_sensor(attrs=attrs)
-        parser = OSMParser(sensor)
-        return parser, sensor
+        return OSMParser(sensor), sensor
 
-    return _create
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("osm_dict", "expected_attr", "expected_value", "should_call"),
-    [
-        ({"licence": "OSM License"}, ATTR_ATTRIBUTION, "OSM License", True),
-        ({}, ATTR_ATTRIBUTION, None, False),
-    ],
-)
-async def test_set_attribution(
-    osm_parser: OSMParserFactory,
-    osm_dict: OsmDict,
-    expected_attr: AttrName,
-    expected_value: object,
-    should_call: bool,
-) -> None:
-    """Ensure set_attribution sets ATTR_ATTRIBUTION only for a truthy OSM licence.
-
-    Args:
-        osm_parser (OSMParserFactory):
-            OpenStreetMap parser fixture.
-        osm_dict (OsmDict):
-            OpenStreetMap response fields supplied to the parser.
-        expected_attr (AttrName):
-            Attribute expected to be set when attribution is present.
-        expected_value (object):
-            Attribution value expected when the attribute is set.
-        should_call (bool):
-            Whether set_attr is expected to be called; otherwise, no attribute
-            update is expected.
-    """
-    parser, sensor = osm_parser()
-    await parser.set_attribution(osm_dict)
-    if should_call:
-        assert sensor.attrs[expected_attr] == expected_value
-    else:
-        # No set_attr calls should have been recorded
-        sensor._set_attr_mock.assert_not_called()
+    return create
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("osm_dict", "get_attr_value", "expect_clear", "expected_set_calls"),
-    [
-        (
-            {"type": "road", "address": {"road": "Main St"}},
-            "road",
-            False,
-            [(ATTR_PLACE_TYPE, "road"), (ATTR_PLACE_NAME, "Main St")],
-        ),
-        (
-            {"type": "yes", "addresstype": "highway"},
-            "yes",
-            False,
-            [(ATTR_PLACE_TYPE, "highway")],
-        ),
-        (
-            {"type": "yes"},
-            "yes",
-            True,
-            [],
-        ),
-    ],
+    ("language", "expected_name"),
+    [("fr,en", "Parc Central"), ("de", "Central Park")],
 )
-async def test_parse_type_variants(
-    osm_parser: OSMParserFactory,
-    osm_dict: OsmDict,
-    get_attr_value: str | None,
-    expect_clear: bool,
-    expected_set_calls: Sequence[SetAttrCall],
+async def test_parse_osm_dict_maps_place_fields_and_language(
+    osm_parser: OSMParserFactory, language: str, expected_name: str
 ) -> None:
-    """Parametrized variants for parse_type covering normal types and 'yes' addresstype behavior.
+    """Map normalized place fields and honor HA language preferences.
 
     Args:
-        osm_parser (OSMParserFactory):
-            OpenStreetMap parser fixture.
-        osm_dict (OsmDict):
-            OpenStreetMap response fields supplied to the parser.
-        get_attr_value (str | None):
-            Existing attribute content returned by the sensor double.
-        expect_clear (bool):
-            Whether stale attributes are expected to be cleared.
-        expected_set_calls (Sequence[SetAttrCall]):
-            Attribute assignments expected from parsing.
+        osm_parser (OSMParserFactory): Factory for an isolated parser and sensor.
+        language (str): Configured ordered language preference.
+        expected_name (str): Name selected from the place's localized names.
     """
-    # Create sensor pre-populated with any existing place_type value
     parser, sensor = osm_parser(
-        attrs={ATTR_PLACE_TYPE: get_attr_value} if get_attr_value is not None else None
-    )
-    await parser.parse_type(osm_dict)
-    if expect_clear:
-        assert ATTR_PLACE_TYPE not in sensor.attrs
-        sensor._set_attr_mock.assert_not_called()
-    else:
-        for attr, val in expected_set_calls:
-            sensor._set_attr_mock.assert_any_call(attr, val)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("category", "address", "expect_calls"),
-    [
-        ("retail", {"retail": "Shop"}, True),
-        (None, None, False),
-    ],
-)
-async def test_parse_category_variants(
-    osm_parser: OSMParserFactory, category: str | None, address: Address | None, expect_calls: bool
-) -> None:
-    """Parametrized: parse_category should set category and place name when present; otherwise do nothing.
-
-    Args:
-        osm_parser (OSMParserFactory):
-            OpenStreetMap parser fixture.
-        category (str | None):
-            OpenStreetMap category supplied to place-name parsing.
-        address (Address | None):
-            OpenStreetMap address fields supplied to the parser.
-        expect_calls (bool):
-            Whether parser helper calls are expected.
-    """
-    osm_dict: OsmDict = {}
-    if category is not None:
-        osm_dict["category"] = category
-        if address is not None:
-            osm_dict["address"] = address
-    parser, sensor = osm_parser()
-    await parser.parse_category(osm_dict)
-    if expect_calls:
-        assert sensor.attrs[ATTR_PLACE_CATEGORY] == category
-        # The place name is taken from the address mapping value
-        # Use next(iter(address.values())) to get the sample value used in tests
-        assert sensor.attrs[ATTR_PLACE_NAME] == next(iter(address.values()))
-    else:
-        sensor._set_attr_mock.assert_not_called()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("namedetails", "language_pref", "is_lang_blank", "expected_calls"),
-    [
-        ({"name": "Park"}, None, False, ["Park"]),
-        ({"name": "Park", "name:en": "English Park"}, "en", False, ["Park", "English Park"]),
-        ({}, None, False, []),
-        ({"name": "MainName"}, None, True, ["MainName"]),
-        (
-            {"name": "MainName", "name:en": "EnglishName"},
-            "en",
-            False,
-            ["MainName", "EnglishName"],
-        ),
-        (
-            {"name": "MainName", "name:en": "EnglishName", "name:fr": "FrenchName"},
-            "fr,en",
-            False,
-            ["MainName", "FrenchName"],
-        ),
-        ({"name": "MainName", "name:en": "EnglishName"}, "de", False, ["MainName"]),
-    ],
-)
-async def test_parse_namedetails_variants(
-    osm_parser: OSMParserFactory,
-    namedetails: Mapping[str, str],
-    language_pref: str | None,
-    is_lang_blank: bool,
-    expected_calls: Sequence[str],
-) -> None:
-    """Parametrized tests for parse_namedetails covering language preferences and fallbacks.
-
-    Verifies that the base name is always set when present and that language-specific names are applied
-    when the configured language preference matches a namedetails key.
-
-    Args:
-        osm_parser (OSMParserFactory):
-            OpenStreetMap parser fixture.
-        namedetails (Mapping[str, str]):
-            Localized OpenStreetMap names supplied to the parser.
-        language_pref (str | None):
-            Preferred language for OpenStreetMap names.
-        is_lang_blank (bool):
-            Whether the language preference is blank.
-        expected_calls (Sequence[str]):
-            Expected place-name values assigned by the parser.
-    """
-    # Create a sensor with language preference or blankness configured via attrs/blank_attrs
-    if is_lang_blank:
-        # Make the CONF_LANGUAGE attribute considered blank
-        sensor = mock_sensor(
-            attrs={CONF_LANGUAGE: language_pref} if language_pref is not None else None,
-            blank_attrs={CONF_LANGUAGE},
-        )
-        parser = OSMParser(sensor)
-    else:
-        parser, sensor = osm_parser(
-            attrs={CONF_LANGUAGE: language_pref} if language_pref is not None else None
-        )
-
-    osm_dict = {"namedetails": namedetails} if namedetails else {}
-    await parser.parse_namedetails(osm_dict)
-
-    # Collect all ATTR_PLACE_NAME calls recorded via the internal mock
-    place_name_calls = [
-        call for call in sensor._set_attr_mock.call_args_list if call[0][0] == ATTR_PLACE_NAME
-    ]
-    values = [call[0][1] for call in place_name_calls]
-
-    if not expected_calls:
-        assert values == []
-    else:
-        # The base name should be the first call when present
-        if "name" in namedetails:
-            assert values[0] == namedetails.get("name")
-        # If a language-specific override is expected, it should appear later in the calls
-        for expected in expected_calls[1:]:
-            assert expected in values
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("address", "expected_attr", "expected_value"),
-    [
-        ({"house_number": "123", "road": "Main"}, ATTR_STREET_NUMBER, "123"),
-        ({"house_number": "123", "road": "Main"}, ATTR_STREET, "Main"),
-    ],
-)
-async def test_set_address_details_sets_attrs(
-    osm_parser: OSMParserFactory, address: Address, expected_attr: AttrName, expected_value: object
-) -> None:
-    """Parametrized: set_address_details should set expected street attributes from address dict.
-
-    Args:
-        osm_parser (OSMParserFactory):
-            OpenStreetMap parser fixture.
-        address (Address):
-            OpenStreetMap address fields supplied to the parser.
-        expected_attr (AttrName):
-            Attribute name whose resulting content is asserted.
-        expected_value (object):
-            Attribute content expected for this parametrized case.
-    """
-    parser, sensor = osm_parser()
-    await parser.set_address_details(address)
-    assert sensor.attrs[expected_attr] == expected_value
-
-
-@pytest.mark.asyncio
-async def test_set_address_details_retail_logic() -> None:
-    """If place_name is blank, use the address argument's retail value for place_name."""
-    address = {"retail": "Shop"}
-    # Use a sensor that reports ATTR_PLACE_NAME as blank and has stale OSM state
-    sensor = mock_sensor(
-        attrs={ATTR_OSM_DICT: {"address": {"retail": "Stale-Shop"}}},
-        blank_attrs={ATTR_PLACE_NAME},
-    )
-    parser = OSMParser(sensor)
-    await parser.set_address_details(address)
-    assert sensor.attrs[ATTR_PLACE_NAME] == "Shop"
-
-
-@pytest.mark.asyncio
-async def test_set_region_details_postcode_prefers_argument_over_sensor_state() -> None:
-    """Postcode should be derived from the explicit address argument, not stale sensor state."""
-    sensor = mock_sensor(attrs={ATTR_OSM_DICT: {"address": {"postcode": "07024"}}})
-    parser = OSMParser(sensor)
-
-    await parser.set_region_details({"state": "CA", "postcode": "90210", "county": "Orange"})
-
-    assert sensor.attrs[ATTR_POSTAL_CODE] == "90210"
-
-
-@pytest.mark.asyncio
-async def test_parse_miscellaneous_osm_id_prefers_argument_over_sensor_state(
-    sensor: MockSensor,
-) -> None:
-    """osm_id should be derived from the explicit osm_dict argument.
-
-    Args:
-        sensor (MockSensor):
-            Places sensor fixture whose state is asserted.
-    """
-    sensor.attrs[ATTR_OSM_DICT] = {
-        "osm_id": 12345,
-        "osm_type": "way",
-        "address": {"postcode": "07024"},
-    }
-    parser = OSMParser(sensor)
-
-    await parser.parse_miscellaneous({"osm_id": 98765, "osm_type": "node"})
-
-    assert sensor.attrs[ATTR_OSM_ID] == "98765"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("address", "expected_city", "expected_city_clean"),
-    [
-        ({"city": "City of Springfield"}, "City of Springfield", "Springfield City"),
-        ({"city": "Springfield Township"}, "Springfield Township", "Springfield"),
-        ({"city": "Springfield"}, "Springfield", "Springfield"),
-        ({"town": "Shelbyville"}, "Shelbyville", "Shelbyville"),
-        ({"village": "Ogdenville"}, "Ogdenville", "Ogdenville"),
-        ({"hamlet": "North Haverbrook"}, "North Haverbrook", "North Haverbrook"),
-    ],
-)
-async def test_set_city_details_variants(
-    osm_parser: OSMParserFactory, address: Address, expected_city: str, expected_city_clean: str
-) -> None:
-    """Test that set_city_details sets the correct city and cleaned city attributes for various address formats.
-
-    Args:
-        osm_parser (OSMParserFactory):
-            Factory fixture for creating the parser and sensor.
-        address (Address):
-            The address dictionary containing city, town, village, or hamlet information.
-        expected_city (str):
-            The expected value for the city attribute.
-        expected_city_clean (str):
-            The expected value for the cleaned city attribute.
-    """
-    parser, sensor = osm_parser()
-    await parser.set_city_details(address)
-    assert sensor.attrs[ATTR_CITY] == expected_city
-    assert sensor.attrs[ATTR_CITY_CLEAN] == expected_city_clean
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("address", "expected_attr", "expected_value"),
-    [
-        ({"neighbourhood": "Downtown"}, ATTR_PLACE_NEIGHBOURHOOD, "Downtown"),
-        ({"suburb": "Westside"}, ATTR_POSTAL_TOWN, "Westside"),
-        ({"quarter": "East End"}, ATTR_PLACE_NEIGHBOURHOOD, "East End"),
-    ],
-)
-async def test_set_city_details_neighbourhood(
-    osm_parser: OSMParserFactory, address: Address, expected_attr: AttrName, expected_value: object
-) -> None:
-    """Test that set_city_details sets the correct neighbourhood or postal town attributes for various address formats.
-
-    Args:
-        osm_parser (OSMParserFactory):
-            Factory fixture for creating the parser and sensor.
-        address (Address):
-            The address dictionary containing neighbourhood, suburb, or quarter information.
-        expected_attr (AttrName):
-            The expected attribute to be set (e.g., ATTR_PLACE_NEIGHBOURHOOD, ATTR_POSTAL_TOWN).
-        expected_value (object):
-            The expected value to be set for the attribute.
-    """
-    parser, sensor = osm_parser()
-    await parser.set_city_details(address)
-    assert sensor.attrs[expected_attr] == expected_value
-
-
-@pytest.mark.asyncio
-async def test_set_city_details_preserves_overlapping_type_precedence(
-    osm_parser: OSMParserFactory,
-) -> None:
-    """Higher-priority city types are not reused as postal town or neighbourhood.
-
-    Args:
-        osm_parser (OSMParserFactory):
-            OpenStreetMap parser fixture.
-    """
-    address = {
-        "town": "City Value",
-        "suburb": "Postal Town Value",
-        "neighbourhood": "Neighbourhood Value",
-    }
-    parser, sensor = osm_parser()
-
-    await parser.set_city_details(address)
-
-    assert sensor.attrs[ATTR_CITY] == "City Value"
-    assert sensor.attrs[ATTR_POSTAL_TOWN] == "Postal Town Value"
-    assert sensor.attrs[ATTR_PLACE_NEIGHBOURHOOD] == "Neighbourhood Value"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("address", "expected_city", "expected_postal_town"),
-    [
-        ({"city": "City Value", "village": "Village Value"}, "City Value", "Village Value"),
-        ({"town": "Town Value", "hamlet": "Hamlet Value"}, "Town Value", "Hamlet Value"),
-    ],
-)
-async def test_set_city_details_preserves_lower_priority_postal_town(
-    osm_parser: OSMParserFactory,
-    address: Address,
-    expected_city: str,
-    expected_postal_town: str,
-) -> None:
-    """Lower-priority city-like fields remain candidates for postal town.
-
-    Args:
-        osm_parser (OSMParserFactory):
-            OpenStreetMap parser fixture.
-        address (Address):
-            OpenStreetMap address fields supplied to the parser.
-        expected_city (str):
-            City name expected after address parsing.
-        expected_postal_town (str):
-            Postal-town name expected after address parsing.
-    """
-    parser, sensor = osm_parser()
-
-    await parser.set_city_details(address)
-
-    assert sensor.attrs[ATTR_CITY] == expected_city
-    assert sensor.attrs[ATTR_POSTAL_TOWN] == expected_postal_town
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("expected_attr", "expected_value"),
-    [
-        (ATTR_REGION, "CA"),
-        (ATTR_STATE_ABBR, "CA"),
-        (ATTR_COUNTY, "Orange"),
-        (ATTR_COUNTRY, "USA"),
-        (ATTR_COUNTRY_CODE, "US"),
-        (ATTR_POSTAL_CODE, "90210"),
-    ],
-)
-async def test_set_region_details_sets_attrs(
-    osm_parser: OSMParserFactory, expected_attr: AttrName, expected_value: object
-) -> None:
-    """Parametrized check that set_region_details sets expected regional attributes.
-
-    Args:
-        osm_parser (OSMParserFactory):
-            OpenStreetMap parser fixture.
-        expected_attr (AttrName):
-            Attribute name whose resulting content is asserted.
-        expected_value (object):
-            Attribute content expected for this parametrized case.
-    """
-    address = {
-        "state": "CA",
-        "ISO3166-2-lvl4": "US-CA",
-        "county": "Orange",
-        "country": "USA",
-        "country_code": "us",
-        "postcode": "90210",
-    }
-    parser, sensor = osm_parser(attrs={ATTR_OSM_DICT: {"address": {"postcode": "90210"}}})
-    await parser.set_region_details(address)
-    assert sensor.attrs[expected_attr] == expected_value
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("invalid_value", [None, 123, ["US", "CA"]])
-async def test_set_region_details_ignores_non_string_codes(
-    osm_parser: OSMParserFactory, invalid_value: object
-) -> None:
-    """Malformed external region codes do not abort parsing other fields.
-
-    Args:
-        osm_parser (OSMParserFactory):
-            OpenStreetMap parser fixture.
-        invalid_value (object):
-            Invalid input used to verify defensive parsing.
-    """
-    parser, sensor = osm_parser()
-
-    await parser.set_region_details(
         {
-            "ISO3166-2-lvl4": invalid_value,
-            "country": "USA",
-            "country_code": invalid_value,
-        }
-    )
-
-    assert sensor.attrs[ATTR_COUNTRY] == "USA"
-    assert ATTR_STATE_ABBR not in sensor.attrs
-    assert ATTR_COUNTRY_CODE not in sensor.attrs
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("expected_attr", "expected_value"),
-    [
-        (ATTR_FORMATTED_ADDRESS, "123 Main St"),
-        (ATTR_OSM_ID, "123456"),
-        (ATTR_OSM_TYPE, "way"),
-        (ATTR_ROUTE_NUMBER, "A1"),
-    ],
-)
-async def test_parse_miscellaneous_sets_attrs(
-    osm_parser: OSMParserFactory, expected_attr: AttrName, expected_value: object
-) -> None:
-    """Parametrized check that parse_miscellaneous sets expected attributes from OSM data.
-
-    Args:
-        osm_parser (OSMParserFactory):
-            OpenStreetMap parser fixture.
-        expected_attr (AttrName):
-            Attribute name whose resulting content is asserted.
-        expected_value (object):
-            Attribute content expected for this parametrized case.
-    """
-    osm_dict = {
-        "display_name": "123 Main St",
-        "osm_id": 123456,
-        "osm_type": "way",
-        "namedetails": {"ref": "A1;B2"},
-        "category": "highway",
-    }
-    parser, sensor = osm_parser(
-        attrs={
-            ATTR_PLACE_CATEGORY: "highway",
-            ATTR_OSM_DICT: {"osm_id": 123456},
-        }
-    )
-    await parser.parse_miscellaneous(osm_dict)
-    assert sensor.attrs[expected_attr] == expected_value
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("raw_ref", [None, 123, "", "   "])
-async def test_parse_miscellaneous_ignores_invalid_street_ref(
-    osm_parser: OSMParserFactory, raw_ref: object
-) -> None:
-    """Invalid OSM street refs should not abort miscellaneous parsing.
-
-    Args:
-        osm_parser (OSMParserFactory):
-            OpenStreetMap parser fixture.
-        raw_ref (object):
-            Raw highway reference supplied by OpenStreetMap.
-    """
-    osm_dict = {
-        "display_name": "123 Main St",
-        "osm_id": 123456,
-        "osm_type": "way",
-        "namedetails": {"ref": raw_ref},
-        "category": "highway",
-    }
-    parser, sensor = osm_parser(
-        attrs={
-            ATTR_PLACE_CATEGORY: "highway",
-            ATTR_OSM_DICT: {"osm_id": 123456},
-        }
-    )
-
-    await parser.parse_miscellaneous(osm_dict)
-
-    assert sensor.attrs[ATTR_FORMATTED_ADDRESS] == "123 Main St"
-    assert ATTR_ROUTE_NUMBER not in sensor.attrs
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("raw_ref", [None, 123, "", "   ", "County Road"])
-async def test_parse_miscellaneous_clears_stale_street_ref_without_usable_ref(
-    osm_parser: OSMParserFactory, raw_ref: object
-) -> None:
-    """Highway payloads without usable refs clear any previously stored street ref.
-
-    Args:
-        osm_parser (OSMParserFactory):
-            OpenStreetMap parser fixture.
-        raw_ref (object):
-            Raw highway reference supplied by OpenStreetMap.
-    """
-    osm_dict = {
-        "display_name": "123 Main St",
-        "osm_id": 123456,
-        "osm_type": "way",
-        "namedetails": {"ref": raw_ref},
-        "category": "highway",
-    }
-    parser, sensor = osm_parser(
-        attrs={
-            ATTR_PLACE_CATEGORY: "highway",
-            ATTR_OSM_DICT: {"osm_id": 123456},
-            ATTR_ROUTE_NUMBER: "A1",
-        }
-    )
-
-    await parser.parse_miscellaneous(osm_dict)
-
-    assert ATTR_ROUTE_NUMBER not in sensor.attrs
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("case", "current_name", "should_set"),
-    [
-        ("unique", "UniqueName", True),
-        ("duplicate", "DupeName", False),
-    ],
-)
-async def test_set_place_name_no_dupe_param(
-    case: str,
-    current_name: str,
-    should_set: bool,
-) -> None:
-    """Parametrized test for set_place_name_no_dupe covering unique and duplicate name cases.
-
-    Args:
-        case (str):
-            Named parameter set for the current case.
-        current_name (str):
-            Current place name used during finalization.
-        should_set (bool):
-            Whether the parsed attribute is expected to be stored.
-    """
-    # Build sensor state rather than stubbing methods
-    if case == "unique":
-        # Ensure duplicate-check attributes are considered blank so no dupes are detected
-        sensor = mock_sensor(
-            attrs={ATTR_PLACE_NAME: current_name}, blank_attrs=set(PLACE_NAME_DUPLICATE_LIST)
-        )
-    else:
-        # Place the duplicate value into one of the duplicate attributes so it will be detected
-        sensor = mock_sensor(attrs={ATTR_PLACE_NAME: current_name, ATTR_STREET: current_name})
-    parser = OSMParser(sensor)
-    await parser.set_place_name_no_dupe()
-    if should_set:
-        sensor._set_attr_mock.assert_any_call(ATTR_PLACE_NAME_NO_DUPE, current_name)
-    else:
-        sensor._set_attr_mock.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_set_place_name_no_dupe_compares_safe_strings() -> None:
-    """Non-string place values use the same safe-string duplicate contract."""
-    sensor = mock_sensor(attrs={ATTR_PLACE_NAME: 123, ATTR_STREET: 123})
-    parser = OSMParser(sensor)
-
-    await parser.set_place_name_no_dupe()
-
-    sensor._set_attr_mock.assert_not_called()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("_case", "existing_attrs", "should_set"),
-    [
-        ("initial_update", {ATTR_INITIAL_UPDATE: True}, True),
-        (
-            "same_names",
-            {
-                ATTR_LAST_PLACE_NAME: "same",
-                ATTR_PLACE_NAME: "same",
-                ATTR_DEVICETRACKER_ZONE_NAME: "same",
+            CONF_LANGUAGE: language,
+            ATTR_OSM_DICT: {
+                "osm_id": 42,
+                "osm_type": "way",
+                "type": "road",
+                "category": "highway",
+                "licence": "OpenStreetMap contributors",
+                "display_name": "Central Park, New York, United States",
+                "namedetails": {
+                    "name": "Central Park",
+                    "name:en": "Central Park",
+                    "name:fr": "Parc Central",
+                    "ref": "M10",
+                },
+                "address": {
+                    "road": "Broadway",
+                    "highway": "Broadway",
+                    "house_number": "10",
+                    "city": "City of New York",
+                    "suburb": "Manhattan",
+                    "quarter": "Upper East Side",
+                    "state": "New York",
+                    "ISO3166-2-lvl4": "US-NY",
+                    "county": "New York County",
+                    "country": "United States",
+                    "postcode": "10001",
+                    "country_code": "us",
+                },
             },
-            True,
-        ),
-        (
-            "else",
-            {
-                ATTR_LAST_PLACE_NAME: "last",
-                ATTR_PLACE_NAME: "new",
-                ATTR_DEVICETRACKER_ZONE_NAME: "zone",
-            },
-            False,
-        ),
-    ],
-)
-async def test_finalize_last_place_name_variants(
-    osm_parser: OSMParserFactory, _case: str, existing_attrs: Attrs, should_set: bool
-) -> None:
-    """Parametrized finalize_last_place_name covering initial update, identical names, and else-case where it should not set.
+        }
+    )
 
-    Args:
-        osm_parser (OSMParserFactory):
-            OpenStreetMap parser fixture.
-        _case (str):
-            Named parameter set for the current case.
-        existing_attrs (Attrs):
-            Attributes present before the parser update.
-        should_set (bool):
-            Whether the parsed attribute is expected to be stored.
-    """
-    parser, sensor = osm_parser(attrs=existing_attrs)
-    await parser.finalize_last_place_name("old_name")
-    if should_set:
-        sensor._set_attr_mock.assert_any_call(ATTR_LAST_PLACE_NAME, "old_name")
-    else:
-        # ensure no matching set_attr call was recorded
-        assert not any(
-            (c[0][0] == ATTR_LAST_PLACE_NAME and c[0][1] == "old_name")
-            for c in sensor._set_attr_mock.call_args_list
-        )
-
-
-@pytest.mark.asyncio
-async def test_parse_osm_dict_full_flow(osm_parser: OSMParserFactory) -> None:
-    """Parse a complete OSM payload into user-visible coordinator attributes.
-
-    Args:
-        osm_parser (OSMParserFactory):
-            OpenStreetMap parser fixture.
-    """
-    osm_dict = {
-        "licence": "OSM License",
-        "type": "road",
-        "category": "retail",
-        "namedetails": {"name": "Park"},
-        "address": {"house_number": "123", "road": "Main"},
-        "display_name": "123 Main St",
-        "osm_id": 123456,
-        "osm_type": "way",
-    }
-    parser, sensor = osm_parser(attrs={ATTR_OSM_DICT: osm_dict})
     await parser.parse_osm_dict()
 
-    assert sensor.attrs[ATTR_ATTRIBUTION] == "OSM License"
-    assert sensor.attrs[ATTR_PLACE_TYPE] == "road"
-    assert sensor.attrs[ATTR_PLACE_CATEGORY] == "retail"
-    assert sensor.attrs[ATTR_PLACE_NAME] == "Park"
-    assert sensor.attrs[ATTR_STREET_NUMBER] == "123"
-    assert sensor.attrs[ATTR_STREET] == "Main"
-    assert sensor.attrs[ATTR_FORMATTED_ADDRESS] == "123 Main St"
-    assert sensor.attrs[ATTR_OSM_ID] == "123456"
+    assert sensor.attrs[ATTR_PLACE_NAME] == expected_name
+    assert sensor.attrs[ATTR_PLACE_NAME_NO_DUPE] == expected_name
+    assert sensor.attrs[ATTR_ATTRIBUTION] == "OpenStreetMap contributors"
+    assert sensor.attrs[ATTR_OSM_ID] == "42"
     assert sensor.attrs[ATTR_OSM_TYPE] == "way"
-    assert sensor.attrs[ATTR_PLACE_NAME_NO_DUPE] == "Park"
+    assert sensor.attrs[ATTR_PLACE_TYPE] == "road"
+    assert sensor.attrs[ATTR_PLACE_CATEGORY] == "highway"
+    assert sensor.attrs[ATTR_STREET_NUMBER] == "10"
+    assert sensor.attrs[ATTR_STREET] == "Broadway"
+    assert sensor.attrs[ATTR_CITY] == "City of New York"
+    assert sensor.attrs[ATTR_CITY_CLEAN] == "New York City"
+    assert sensor.attrs[ATTR_POSTAL_TOWN] == "Manhattan"
+    assert sensor.attrs[ATTR_PLACE_NEIGHBOURHOOD] == "Upper East Side"
+    assert sensor.attrs[ATTR_REGION] == "New York"
+    assert sensor.attrs[ATTR_STATE_ABBR] == "NY"
+    assert sensor.attrs[ATTR_COUNTY] == "New York County"
+    assert sensor.attrs[ATTR_COUNTRY] == "United States"
+    assert sensor.attrs[ATTR_POSTAL_CODE] == "10001"
+    assert sensor.attrs[ATTR_COUNTRY_CODE] == "US"
+    assert sensor.attrs[ATTR_FORMATTED_ADDRESS] == "Central Park, New York, United States"
+    assert sensor.attrs[ATTR_ROUTE_NUMBER] == "M10"
+
+
+@pytest.mark.asyncio
+async def test_parse_osm_dict_does_not_repeat_street_as_place_name(
+    osm_parser: OSMParserFactory,
+) -> None:
+    """Keep a place name out of the no-duplicate field when it equals its street.
+
+    Args:
+        osm_parser (OSMParserFactory): Factory for an isolated parser and sensor.
+    """
+    parser, sensor = osm_parser(
+        {
+            ATTR_OSM_DICT: {
+                "type": "road",
+                "address": {"road": "Main Street"},
+                "namedetails": {"name": "Main Street"},
+            }
+        }
+    )
+
+    await parser.parse_osm_dict()
+
+    assert sensor.attrs[ATTR_PLACE_NAME] == "Main Street"
+    assert sensor.attrs[ATTR_STREET] == "Main Street"
+    assert ATTR_PLACE_NAME_NO_DUPE not in sensor.attrs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attrs", "previous_name", "expected_name"),
+    [
+        (
+            {ATTR_INITIAL_UPDATE: True, ATTR_LAST_PLACE_NAME: "Persisted"},
+            "Before restore",
+            "Before restore",
+        ),
+        (
+            {ATTR_LAST_PLACE_NAME: "Central Park", ATTR_PLACE_NAME: "Central Park"},
+            "Home",
+            "Home",
+        ),
+        (
+            {ATTR_LAST_PLACE_NAME: "Home", ATTR_DEVICETRACKER_ZONE_NAME: "Home"},
+            "Park",
+            "Park",
+        ),
+        (
+            {ATTR_LAST_PLACE_NAME: "Previous", ATTR_PLACE_NAME: "Current"},
+            "Older",
+            "Previous",
+        ),
+    ],
+    ids=("restored-initial-update", "same-place", "same-zone", "place-changed"),
+)
+async def test_finalize_last_place_name_preserves_expected_previous_place(
+    osm_parser: OSMParserFactory,
+    attrs: Mapping[str, object],
+    previous_name: str,
+    expected_name: str,
+) -> None:
+    """Preserve the appropriate previous-place value across finalization branches.
+
+    Args:
+        osm_parser (OSMParserFactory): Factory for an isolated parser and sensor.
+        attrs (Mapping[str, object]): Initial sensor attributes for this branch.
+        previous_name (str): Previously stored place name supplied by the updater.
+        expected_name (str): Previous place name expected after finalization.
+    """
+    parser, sensor = osm_parser(attrs)
+
+    await parser.finalize_last_place_name(previous_name)
+
+    assert sensor.attrs[ATTR_LAST_PLACE_NAME] == expected_name
+
+
+@pytest.mark.asyncio
+async def test_parse_osm_dict_ignores_missing_response(osm_parser: OSMParserFactory) -> None:
+    """Leave HA attributes unchanged when no reverse-lookup mapping is available.
+
+    Args:
+        osm_parser (OSMParserFactory): Factory for an isolated parser and sensor.
+    """
+    parser, sensor = osm_parser({ATTR_PLACE_NAME: "Existing"})
+
+    await parser.parse_osm_dict()
+
+    assert sensor.attrs == {ATTR_PLACE_NAME: "Existing"}

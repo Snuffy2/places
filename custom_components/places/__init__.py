@@ -5,24 +5,15 @@ from collections.abc import Callable
 import logging
 import re
 
-import cachetools
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv, entity_registry as er
+from homeassistant.helpers.typing import ConfigType
 
-from .const import (
-    CONF_DISPLAY_OPTIONS,
-    CONF_NAME,
-    DEFAULT_DISPLAY_OPTIONS,
-    DOMAIN,
-    OSM_CACHE,
-    OSM_CACHE_MAX_AGE_HOURS,
-    OSM_CACHE_MAX_SIZE,
-    OSM_THROTTLE,
-    PLATFORMS,
-)
+from .const import CONF_DISPLAY_OPTIONS, CONF_NAME, DEFAULT_DISPLAY_OPTIONS, DOMAIN, PLATFORMS
 from .coordinator import PlacesUpdateCoordinator
+from .helpers import _ensure_places_client
 from .migration import async_migrate_legacy_snapshot
 from .persistence import PlacesStorage
 
@@ -31,25 +22,27 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 CONFIG_SCHEMA: Callable[[dict], dict] = cv.empty_config_schema(DOMAIN)
 
 
-def _ensure_osm_runtime_state(hass: HomeAssistant) -> None:
-    """Initialize shared OSM cache and throttle state.
+def _align_aioplaces_log_level() -> None:
+    """Mirror the integration log level onto aioplaces when it is unset."""
+    aioplaces_logger = logging.getLogger("aioplaces")
+    if _LOGGER.level == logging.NOTSET or aioplaces_logger.level != logging.NOTSET:
+        return
+
+    aioplaces_logger.setLevel(_LOGGER.level)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Align library logging during domain setup.
 
     Args:
-        hass (HomeAssistant):
-            Home Assistant instance that owns integration runtime data.
+        hass (HomeAssistant): Home Assistant instance.
+        config (ConfigType): YAML configuration mapping, unused for config-entry setup.
+
+    Returns:
+        bool: Always ``True`` after configuring library logging.
     """
-    domain_data = hass.data.setdefault(DOMAIN, {})
-    domain_data.setdefault(
-        OSM_CACHE,
-        cachetools.TTLCache(maxsize=OSM_CACHE_MAX_SIZE, ttl=OSM_CACHE_MAX_AGE_HOURS * 3600),
-    )
-    domain_data.setdefault(
-        OSM_THROTTLE,
-        {
-            "lock": asyncio.Lock(),
-            "last_query": 0.0,
-        },
-    )
+    _align_aioplaces_log_level()
+    return True
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -186,7 +179,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         Exception:
             Propagated when the operation fails.
     """
-    _ensure_osm_runtime_state(hass)
+    _ensure_places_client(hass)
     name = entry.data.get(CONF_NAME, entry.entry_id)
     persistence = PlacesStorage(hass=hass, entry_id=entry.entry_id, name=name)
     imported_attributes = await persistence.async_load()

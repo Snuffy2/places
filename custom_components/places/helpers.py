@@ -1,9 +1,23 @@
-"""Parsing and formatting helpers for the Places integration."""
+"""Shared client and formatting helpers for the Places integration."""
 
 from __future__ import annotations
 
 import re
 from typing import Any
+
+from aioplaces import PlacesClient
+from homeassistant.const import __version__ as ha_version
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+from .const import (
+    DOMAIN,
+    OSM_CACHE_MAX_AGE_HOURS,
+    OSM_CACHE_MAX_SIZE,
+    OSM_THROTTLE_INTERVAL_SECONDS,
+    PLACES_CLIENT,
+    VERSION,
+)
 
 
 def is_float(value: Any) -> bool:
@@ -56,3 +70,30 @@ def safe_truncate(val: object | None, max_len: int) -> str:
     """
     s = str(val) if val is not None else ""
     return s[:max_len] if len(s) > max_len else s
+
+
+def _ensure_places_client(hass: HomeAssistant) -> PlacesClient:
+    """Return the client shared by all Places entries on this HA instance.
+
+    Args:
+        hass (HomeAssistant): Home Assistant instance that owns the session.
+
+    Returns:
+        PlacesClient: Client with shared caching and request spacing.
+    """
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    client = domain_data.get(PLACES_CLIENT)
+    if client is None:
+        client = PlacesClient(
+            async_get_clientsession(hass),
+            base_url="https://nominatim.openstreetmap.org",
+            user_agent=(
+                f"Mozilla/5.0 (Home Assistant/{ha_version}) "
+                f"{DOMAIN}/{VERSION} (+https://github.com/custom-components/places)"
+            ),
+            cache_ttl=OSM_CACHE_MAX_AGE_HOURS * 3600,
+            cache_maxsize=OSM_CACHE_MAX_SIZE,
+            min_request_interval=OSM_THROTTLE_INTERVAL_SECONDS,
+        )
+        domain_data[PLACES_CLIENT] = client
+    return client

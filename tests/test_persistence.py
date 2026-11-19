@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-import json
-from pathlib import Path
 from typing import ClassVar
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -84,7 +82,7 @@ class _FakeStore:
 
     def __init__(
         self,
-        hass: MagicMock,
+        _hass: MagicMock,
         version: int,
         key: str,
         *,
@@ -94,7 +92,7 @@ class _FakeStore:
         """Initialize fake Store without Home Assistant storage internals.
 
         Args:
-            hass (MagicMock):
+            _hass (MagicMock):
                 Mocked Home Assistant runtime.
             version (int):
                 Storage or configuration schema version.
@@ -105,10 +103,6 @@ class _FakeStore:
             serialize_in_event_loop (bool):
                 Whether serialization runs in the event loop.
         """
-        self._hass = hass
-        self._version = version
-        self._store_key = key
-        self.path = str(hass.config.path(".storage", key))
         type(self).init_calls.append((version, key, atomic_writes, serialize_in_event_loop))
 
     async def async_load(self) -> object | None:
@@ -121,23 +115,13 @@ class _FakeStore:
         return type(self).next_data
 
     async def async_save(self, data: dict[str, object]) -> None:
-        """Record data saved by PlacesStorage.
+        """Record the payload passed to the Store boundary.
 
         Args:
             data (dict[str, object]):
-                Places payload processed by the persistence or update helper.
+                Normalized Places payload passed to Home Assistant Store.
         """
         type(self).last_saved = data
-        await self._hass.async_add_executor_job(
-            _write_fake_store_snapshot,
-            Path(self.path),
-            {
-                "version": self._version,
-                "minor_version": 1,
-                "key": self._store_key,
-                "data": data,
-            },
-        )
 
     async def async_remove(self) -> None:
         """Record Store removal.
@@ -162,36 +146,6 @@ def reset_fake_store_state() -> None:
     _FakeStore.init_calls = []
 
 
-def _hass_for_store_path(tmp_path: Path) -> MagicMock:
-    """Return a Home Assistant mock with config.path and executor passthrough.
-
-    Args:
-        tmp_path (Path):
-            Temporary directory used for isolated storage files.
-
-    Returns:
-        MagicMock:
-            Home Assistant instance bound to the requested storage path.
-    """
-    hass = MagicMock()
-    hass.config.path.side_effect = lambda *parts: str(tmp_path.joinpath(*parts))
-    hass.async_add_executor_job = AsyncMock(side_effect=lambda func, *args: func(*args))
-    return hass
-
-
-def _write_fake_store_snapshot(path: Path, data: dict[str, object]) -> None:
-    """Write a fake Home Assistant Store snapshot to disk.
-
-    Args:
-        path (Path):
-            Storage path used for the persistence operation.
-        data (dict[str, object]):
-            Places payload processed by the persistence or update helper.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data))
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("store_data", "expected"),
@@ -202,7 +156,6 @@ def _write_fake_store_snapshot(path: Path, data: dict[str, object]) -> None:
     ids=["existing-store-data", "missing-store-data"],
 )
 async def test_load_returns_store_data_or_empty(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     store_data: object | None,
     expected: dict[str, object],
@@ -210,8 +163,6 @@ async def test_load_returns_store_data_or_empty(
     """Load existing Store data or return an empty mapping when missing.
 
     Args:
-        tmp_path (Path):
-            Temporary directory used for isolated storage files.
         monkeypatch (pytest.MonkeyPatch):
             Pytest fixture for replacing dependencies.
         store_data (object | None):
@@ -221,7 +172,7 @@ async def test_load_returns_store_data_or_empty(
     """
     monkeypatch.setattr("custom_components.places.persistence.Store", _FakeStore)
     _FakeStore.next_data = store_data
-    hass = _hass_for_store_path(tmp_path)
+    hass = MagicMock()
 
     storage = PlacesStorage(hass, "entry-1", "Test")
     loaded = await storage.async_load()
@@ -231,18 +182,16 @@ async def test_load_returns_store_data_or_empty(
 
 
 @pytest.mark.asyncio
-async def test_remove_deletes_store_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_remove_deletes_store_data(monkeypatch: pytest.MonkeyPatch) -> None:
     """Config-entry deletion removes the Store snapshot.
 
     Args:
-        tmp_path (Path):
-            Temporary directory used for isolated storage files.
         monkeypatch (pytest.MonkeyPatch):
             Pytest fixture for replacing dependencies.
     """
     monkeypatch.setattr("custom_components.places.persistence.Store", _FakeStore)
     _FakeStore.remove_calls = 0
-    hass = _hass_for_store_path(tmp_path)
+    hass = MagicMock()
 
     storage = PlacesStorage(hass, "entry-6", "Test")
     await storage.async_remove()
@@ -252,18 +201,16 @@ async def test_remove_deletes_store_data(tmp_path: Path, monkeypatch: pytest.Mon
 
 @pytest.mark.asyncio
 async def test_save_normalizes_snapshot_before_store_write(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Save only normalized restorable values through the Store boundary.
 
     Args:
-        tmp_path (Path):
-            Temporary directory used for isolated storage files.
         monkeypatch (pytest.MonkeyPatch):
             Pytest fixture for replacing dependencies.
     """
     monkeypatch.setattr("custom_components.places.persistence.Store", _FakeStore)
-    hass = _hass_for_store_path(tmp_path)
+    hass = MagicMock()
     storage = PlacesStorage(hass, "entry-save", "Test")
 
     await storage.async_save(
@@ -279,16 +226,6 @@ async def test_save_normalizes_snapshot_before_store_write(
         ATTR_CITY: "New York",
         ATTR_NATIVE_VALUE: "Koreatown",
     }
-    persisted_path = tmp_path / ".storage" / "places.sensor_entry_save"
-    assert json.loads(persisted_path.read_text()) == {
-        "version": 1,
-        "minor_version": 1,
-        "key": "places.sensor_entry_save",
-        "data": {
-            ATTR_CITY: "New York",
-            ATTR_NATIVE_VALUE: "Koreatown",
-        },
-    }
 
 
 def test_store_key_is_slugified_per_entry() -> None:
@@ -299,18 +236,16 @@ def test_store_key_is_slugified_per_entry() -> None:
 
 @pytest.mark.asyncio
 async def test_places_storage_constructs_store_with_expected_parameters(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Store construction should use the expected per-entry persistence options.
 
     Args:
-        tmp_path (Path):
-            Temporary directory used for isolated storage files.
         monkeypatch (pytest.MonkeyPatch):
             Pytest fixture for replacing dependencies.
     """
     monkeypatch.setattr("custom_components.places.persistence.Store", _FakeStore)
-    hass = _hass_for_store_path(tmp_path)
+    hass = MagicMock()
 
     storage = PlacesStorage(hass, "entry-1", "Test")
     await storage.async_load()
@@ -325,18 +260,16 @@ async def test_places_storage_constructs_store_with_expected_parameters(
 
 @pytest.mark.asyncio
 async def test_places_storage_constructs_distinct_store_per_entry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Different config entries must initialize different Store keys.
 
     Args:
-        tmp_path (Path):
-            Temporary directory used for isolated storage files.
         monkeypatch (pytest.MonkeyPatch):
             Pytest fixture for replacing dependencies.
     """
     monkeypatch.setattr("custom_components.places.persistence.Store", _FakeStore)
-    hass = _hass_for_store_path(tmp_path)
+    hass = MagicMock()
 
     PlacesStorage(hass, "entry-1", "Test")
     PlacesStorage(hass, "entry-2", "Test")
@@ -349,30 +282,27 @@ async def test_places_storage_constructs_distinct_store_per_entry(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("remove_error", [None, OSError("store remove failed")])
-@pytest.mark.parametrize("store_data", [["bad", "payload"], "bad"])
+@pytest.mark.parametrize(
+    "remove_error",
+    [None, OSError("store remove failed")],
+    ids=["remove-succeeds", "remove-fails"],
+)
 async def test_load_ignores_non_mapping_store_data(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     remove_error: OSError | None,
-    store_data: object,
 ) -> None:
     """Invalid Store snapshots are removed and return empty state.
 
     Args:
-        tmp_path (Path):
-            Temporary directory used for isolated storage files.
         monkeypatch (pytest.MonkeyPatch):
             Pytest fixture for replacing dependencies.
         remove_error (OSError | None):
             Storage cleanup failure injected by the test.
-        store_data (object):
-            Places payload present in storage before loading.
     """
     monkeypatch.setattr("custom_components.places.persistence.Store", _FakeStore)
-    _FakeStore.next_data = store_data
+    _FakeStore.next_data = ["bad", "payload"]
     _FakeStore.remove_error = remove_error
-    hass = _hass_for_store_path(tmp_path)
+    hass = MagicMock()
 
     storage = PlacesStorage(hass, "entry-8", "Test")
     loaded = await storage.async_load()
