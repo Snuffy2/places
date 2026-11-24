@@ -4,7 +4,7 @@
 
 | Name                                           |    Stmts |     Miss |   Branch |   BrPart |   Cover |   Missing |
 |----------------------------------------------- | -------: | -------: | -------: | -------: | ------: | --------: |
-| custom\_components/places/\_\_init\_\_.py      |      159 |        8 |       38 |        4 |     94% |172-173, 182-183, 222-224, 250-252, 307-\>319, 322-\>330, 333-\>335, 338-\>350 |
+| custom\_components/places/\_\_init\_\_.py      |      161 |        8 |       40 |        4 |     94% |176-177, 186-187, 226-228, 254-256, 311-\>323, 326-\>334, 337-\>339, 342-\>354 |
 | custom\_components/places/advanced\_options.py |       75 |        0 |       34 |        1 |     99% | 111-\>113 |
 | custom\_components/places/attributes.py        |       65 |        5 |       26 |        2 |     92% |65-\>exit, 126-127, 150-151, 212 |
 | custom\_components/places/basic\_options.py    |       93 |        3 |       38 |        2 |     96% |304-305, 334 |
@@ -12,7 +12,7 @@
 | custom\_components/places/config\_flow.py      |       95 |        0 |       46 |        1 |     99% |   87-\>83 |
 | custom\_components/places/config\_schema.py    |       18 |        0 |        0 |        0 |    100% |           |
 | custom\_components/places/const.py             |      105 |        0 |        0 |        0 |    100% |           |
-| custom\_components/places/coordinator.py       |      288 |       17 |       80 |       13 |     91% |207, 313-319, 415-416, 437-\>440, 455, 508-\>510, 518, 520-\>530, 551, 554, 574, 586, 618 |
+| custom\_components/places/coordinator.py       |      291 |       17 |       82 |       13 |     91% |207, 313-319, 421-422, 443-\>446, 461, 514-\>516, 524, 526-\>536, 557, 560, 580, 592, 624 |
 | custom\_components/places/display\_options.py  |      150 |        0 |       46 |        1 |     99% | 217-\>219 |
 | custom\_components/places/entity.py            |       38 |        2 |        2 |        1 |     92% |   88, 130 |
 | custom\_components/places/helpers.py           |       16 |        0 |        2 |        0 |    100% |           |
@@ -28,7 +28,7 @@
 | custom\_components/places/text.py              |       24 |        0 |        0 |        0 |    100% |           |
 | custom\_components/places/tracker.py           |       86 |        0 |       16 |        0 |    100% |           |
 | custom\_components/places/update\_sensor.py    |      476 |       16 |      186 |       18 |     95% |178, 319, 444-\>exit, 445-\>447, 447-\>exit, 538-\>540, 544-\>547, 554, 664, 665-\>667, 669-673, 790, 813-\>exit, 833-\>exit, 925-\>936, 1024, 1119, 1120-\>1130, 1122-1128, 1132-1134, 1139-\>exit |
-| **TOTAL**                                      | **2318** |   **61** |  **684** |   **53** | **96%** |           |
+| **TOTAL**                                      | **2323** |   **61** |  **688** |   **53** | **96%** |           |
 
 
 ## Setup coverage badge
